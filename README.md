@@ -18,15 +18,11 @@ The deploy page will clone the repository, create the Worker, ask for required s
 
 ## Configuration
 
-Set these in the Cloudflare Worker settings after deployment:
-
 | Name | Type | Required | Description |
 | --- | --- | --- | --- |
 | `REALM_ID` | Variable | Yes | The only realm ID accepted by this Worker. |
 | `REALM_TOKEN` | Secret | Yes | Shared token used by your Hysteria realm server and clients. |
 | `DEBUG` | Variable | No | Keep `false` for normal use. Set `true` only while troubleshooting. |
-
-`REALM_TOKEN` is listed in `.dev.vars.example`, so Deploy Button prompts for it as a Worker secret.
 
 ## Notes
 

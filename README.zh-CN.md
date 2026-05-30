@@ -18,15 +18,11 @@
 
 ## 配置
 
-部署后在 Cloudflare Worker 的设置里配置：
-
 | 名称 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | `REALM_ID` | Variable | 是 | 这个 Worker 接受的唯一 realm ID。 |
 | `REALM_TOKEN` | Secret | 是 | Hysteria realm server 和 client 共用的 token。 |
 | `DEBUG` | Variable | 否 | 正常使用保持 `false`，排查问题时再改成 `true`。 |
-
-`REALM_TOKEN` 已写在 `.dev.vars.example` 里，通过 Deploy Button 部署时会作为 Worker secret 让用户填写。
 
 ## 注意
 
