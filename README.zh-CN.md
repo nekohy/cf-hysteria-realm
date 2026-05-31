@@ -8,6 +8,8 @@
 
 每个 Worker 部署只对应一个 `REALM_ID`。如果需要多个 realm，请部署多个 Worker。
 
+Cloudflare 单个账户 Durable Objects 的免费配额只够支撑一个 Worker 部署。
+
 ## 部署
 
 点击下面的按钮即可通过 Cloudflare 部署：

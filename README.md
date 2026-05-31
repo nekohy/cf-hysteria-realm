@@ -8,6 +8,8 @@ This project deploys a lightweight Hysteria Realm rendezvous API on Cloudflare W
 
 Each deployment accepts one configured realm. Deploy another Worker instance if you need another realm.
 
+Cloudflare's Durable Objects free quota per account is only enough to support one Worker deployment.
+
 ## Deploy
 
 Click the button below to deploy this Worker with Cloudflare:
