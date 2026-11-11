@@ -172,7 +172,7 @@ async function deregister(request: Request, app: App, route: { realmId: string }
   const result = await app.store.deregister(route.realmId, bearer(request));
   if (!result) return errorResponse(401, "invalid_token", "invalid session token");
 
-  await closePreviousSession(app, result.session, result.canceledAttempts);
+  await closeSession(app, result.session, result.canceledAttempts);
   return new Response(null, { status: 204 });
 }
 
@@ -211,9 +211,7 @@ async function events(request: Request, app: App, route: { realmId: string }): P
   const streamId = crypto.randomUUID();
   let upstream: Response;
   try {
-    upstream = await app.ably.subscribe(sessionChannel(session.realmId, session.id), {
-      signal: abort.signal,
-    });
+    upstream = await app.ably.subscribe(sessionChannel(session.realmId, session.id), abort.signal);
     const leasedSession = await app.store.openEventStream(session.realmId, session.id, streamId);
     if (!leasedSession) {
       abort.abort();
@@ -392,9 +390,7 @@ async function connect(request: Request, app: App, route: { realmId: string }): 
     const notifyAndWait = async (): Promise<void> => {
       let upstream: Response | null;
       try {
-        upstream = await app.ably.subscribe(attemptChannel(route.realmId, session.id, attempt.id), {
-          signal: abort.signal,
-        });
+        upstream = await app.ably.subscribe(attemptChannel(route.realmId, session.id, attempt.id), abort.signal);
         await app.ably.publish(sessionChannel(route.realmId, session.id), "punch", {
           eventId: event.id,
         }, abort.signal);
@@ -407,9 +403,10 @@ async function connect(request: Request, app: App, route: { realmId: string }): 
 
       while (!abort.signal.aborted) {
         try {
-          upstream ??= await app.ably.subscribe(attemptChannel(route.realmId, session.id, attempt.id), {
-            signal: abort.signal,
-          });
+          upstream ??= await app.ably.subscribe(
+            attemptChannel(route.realmId, session.id, attempt.id),
+            abort.signal,
+          );
           await waitForAttemptSignal(upstream, abort.signal);
           return;
         } catch (error) {
@@ -483,7 +480,7 @@ async function connectResponse(
   return new Response(null, { status: 204 });
 }
 
-async function closePreviousSession(
+async function closeSession(
   app: App,
   session: StoredSession | null,
   canceledAttempts: StoredAttempt[],

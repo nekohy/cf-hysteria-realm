@@ -2,14 +2,8 @@ const ABLY_REST_BASE = "https://main.realtime.ably.net";
 const ABLY_SSE_URL = `${ABLY_REST_BASE}/sse`;
 
 export interface AblyMessage {
-  id: string;
   name: string;
   data: unknown;
-}
-
-export interface AblySubscribeOptions {
-  signal?: AbortSignal;
-  lastEventId?: string;
 }
 
 export class AblyError extends Error {
@@ -50,13 +44,10 @@ export class AblyClient {
     }
   }
 
-  async subscribe(channel: string, options: AblySubscribeOptions = {}): Promise<Response> {
+  async subscribe(channel: string, signal?: AbortSignal): Promise<Response> {
     const url = new URL(ABLY_SSE_URL);
     url.searchParams.set("channels", channel);
     url.searchParams.set("v", "1.2");
-    if (options.lastEventId !== undefined) {
-      url.searchParams.set("lastEvent", options.lastEventId);
-    }
 
     const response = await this.fetchImpl(url.toString(), {
       method: "GET",
@@ -64,7 +55,7 @@ export class AblyClient {
         Accept: "text/event-stream",
         Authorization: this.authorization(),
       },
-      signal: options.signal,
+      signal,
     });
     if (!response.ok) {
       throw new AblyError(`Ably subscribe failed with status ${response.status}`, response.status);
@@ -81,7 +72,6 @@ export class AblyClient {
 }
 
 type SseFrame = {
-  id?: string;
   type: string;
   data: string;
 };
@@ -102,7 +92,6 @@ export async function* readAblyMessages(
   signal?.addEventListener("abort", onAbort, { once: true });
 
   let buffer = "";
-  let eventId: string | undefined;
   let eventType = "";
   let dataLines: string[] = [];
   let streamEnded = false;
@@ -127,12 +116,10 @@ export async function* readAblyMessages(
 
         if (line === "") {
           const frame: SseFrame = {
-            id: eventId,
             type: eventType || "message",
             data: dataLines.join("\n"),
           };
           const hasData = dataLines.length > 0;
-          eventId = undefined;
           eventType = "";
           dataLines = [];
 
@@ -163,9 +150,6 @@ export async function* readAblyMessages(
             eventType = value;
             break;
           case "id":
-            if (!value.includes("\0")) {
-              eventId = value;
-            }
             break;
         }
       }
@@ -256,8 +240,6 @@ function decodeAblyMessage(frame: SseFrame): AblyMessage {
   }
 
   return {
-    // Ably resumes SSE with the stream frame id, not the enclosed message id.
-    id: frame.id || (typeof envelope.id === "string" ? envelope.id : ""),
     name: typeof envelope.name === "string" ? envelope.name : "",
     data,
   };

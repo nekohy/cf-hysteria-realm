@@ -595,30 +595,31 @@ export class RealmStore {
       .run();
   }
 
-  async takeEvents(realmId: string, sessionId: string): Promise<StoredEvent[]> {
-    const result = await this.db
-      .prepare(
-        `SELECT ${EVENT_COLUMNS}
-         FROM realm_events
-         WHERE realm_id = ? AND session_id = ?
-         ORDER BY sequence ASC`,
-      )
-      .bind(realmId, sessionId)
-      .all<EventRow>();
-    return result.results.map(toEvent);
-  }
-
-  async deleteEvents(ids: string[]): Promise<void> {
-    if (ids.length === 0) return;
-    await this.db.batch(
-      ids.map((id) => this.db.prepare("DELETE FROM realm_events WHERE id = ?").bind(id)),
-    );
-  }
-
   async claimEvents(
     realmId: string,
     sessionId: string,
     streamId: string,
+  ): Promise<ClaimEventsResult> {
+    return this.claim(realmId, sessionId, streamId, null, EVENTS_BUFFER_SIZE);
+  }
+
+  async claimEvent(
+    realmId: string,
+    sessionId: string,
+    streamId: string,
+    eventId: string,
+  ): Promise<ClaimEventResult> {
+    const result = await this.claim(realmId, sessionId, streamId, eventId, 1);
+    if (result.status === "not_owner") return result;
+    return { status: "ok", event: result.events[0] ?? null };
+  }
+
+  private async claim(
+    realmId: string,
+    sessionId: string,
+    streamId: string,
+    eventId: string | null,
+    limit: number,
   ): Promise<ClaimEventsResult> {
     const now = Date.now();
     const [ownerResult, deleteResult] = await this.db.batch([
@@ -638,6 +639,7 @@ export class RealmStore {
            WHERE sequence IN (
              SELECT sequence FROM realm_events
              WHERE realm_id = ? AND session_id = ?
+               AND (? IS NULL OR id = ?)
              ORDER BY sequence ASC
              LIMIT ?
            )
@@ -654,7 +656,9 @@ export class RealmStore {
         .bind(
           realmId,
           sessionId,
-          EVENTS_BUFFER_SIZE,
+          eventId,
+          eventId,
+          limit,
           realmId,
           sessionId,
           streamId,
@@ -665,45 +669,6 @@ export class RealmStore {
     const rows = deleteResult.results as ClaimedEventRow[];
     rows.sort((left, right) => left.sequence - right.sequence);
     return { status: "ok", events: rows.map(toEvent) };
-  }
-
-  async claimEvent(
-    realmId: string,
-    sessionId: string,
-    streamId: string,
-    eventId: string,
-  ): Promise<ClaimEventResult> {
-    const now = Date.now();
-    const [ownerResult, deleteResult] = await this.db.batch([
-      this.db
-        .prepare(
-          `SELECT 1 AS owned
-           FROM event_streams AS stream
-           INNER JOIN realm_sessions AS session
-             ON session.realm_id = stream.realm_id AND session.id = stream.session_id
-           WHERE stream.realm_id = ? AND stream.session_id = ? AND stream.stream_id = ?
-             AND session.expires_at > ?`,
-        )
-        .bind(realmId, sessionId, streamId, now),
-      this.db
-        .prepare(
-          `DELETE FROM realm_events
-           WHERE realm_id = ? AND session_id = ? AND id = ?
-             AND EXISTS (
-               SELECT 1
-               FROM event_streams AS stream
-               INNER JOIN realm_sessions AS session
-                 ON session.realm_id = stream.realm_id AND session.id = stream.session_id
-               WHERE stream.realm_id = ? AND stream.session_id = ? AND stream.stream_id = ?
-                 AND session.expires_at > ?
-             )
-           RETURNING ${EVENT_COLUMNS}`,
-        )
-        .bind(realmId, sessionId, eventId, realmId, sessionId, streamId, now),
-    ]);
-    if (ownerResult.results.length === 0) return { status: "not_owner" };
-    const row = deleteResult.results[0] as EventRow | undefined;
-    return { status: "ok", event: row ? toEvent(row) : null };
   }
 
   async metrics(): Promise<MetricsResult> {

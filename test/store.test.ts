@@ -5,6 +5,7 @@ import {
   MAX_PENDING_ATTEMPTS,
   RealmStore,
   SESSION_TTL_MS,
+  type StoredEvent,
 } from "../src/store";
 
 interface SqliteStatement {
@@ -16,6 +17,15 @@ interface SqliteDatabase {
   exec(query: string): void;
   prepare(query: string): SqliteStatement;
   close(): void;
+}
+
+interface EventRow {
+  id: string;
+  realm_id: string;
+  session_id: string;
+  name: string;
+  data: string;
+  created_at: number;
 }
 
 const [{ readFileSync }, { DatabaseSync }] = await Promise.all([
@@ -92,14 +102,12 @@ class FakeD1PreparedStatement {
 
 class FakeD1Database {
   private readonly database: SqliteDatabase = new DatabaseSync(":memory:");
-  prepareCalls = 0;
 
   constructor() {
     this.database.exec(MIGRATION_SQL);
   }
 
   prepare(query: string): FakeD1PreparedStatement {
-    this.prepareCalls += 1;
     return new FakeD1PreparedStatement(this.database, query);
   }
 
@@ -122,6 +130,30 @@ class FakeD1Database {
   close(): void {
     this.database.close();
   }
+}
+
+async function readEvents(
+  database: FakeD1Database,
+  realmId: string,
+  sessionId: string,
+): Promise<StoredEvent[]> {
+  const result = await database
+    .prepare(
+      `SELECT id, realm_id, session_id, name, data, created_at
+       FROM realm_events
+       WHERE realm_id = ? AND session_id = ?
+       ORDER BY sequence ASC`,
+    )
+    .bind(realmId, sessionId)
+    .all<EventRow>();
+  return result.results.map((row) => ({
+    id: row.id,
+    realmId: row.realm_id,
+    sessionId: row.session_id,
+    name: row.name,
+    data: JSON.parse(row.data) as unknown,
+    createdAt: row.created_at,
+  }));
 }
 
 async function registerOk(
@@ -202,7 +234,7 @@ describe("RealmStore", () => {
       status: "realm_taken",
     });
     expect(await store.session("realm-a", session.id)).toEqual(session);
-    expect(await store.takeEvents("realm-a", session.id)).toEqual([started.event]);
+    expect(await readEvents(database, "realm-a", session.id)).toEqual([started.event]);
     expect(
       await store.endConnect("realm-a", "pending-nonce", session.id, started.attempt.id),
     ).toEqual({ status: "fallback", addresses: INITIAL_ADDRESSES });
@@ -222,7 +254,7 @@ describe("RealmStore", () => {
     expect(result.session.addresses).toEqual(UPDATED_ADDRESSES);
     expect(result.session.expiresAt).toBe(Date.now() + SESSION_TTL_MS);
     expect(await store.session("realm-a", first.id)).toBeNull();
-    expect(await store.takeEvents("realm-a", first.id)).toEqual([]);
+    expect(await readEvents(database, "realm-a", first.id)).toEqual([]);
     expect(
       await database
         .prepare("SELECT COUNT(*) AS count FROM connect_attempts WHERE realm_id = ?")
@@ -252,7 +284,7 @@ describe("RealmStore", () => {
 
     expect(await store.deregister("realm-a", first.id)).toBeNull();
     expect(await store.session("realm-a", second.id)).toEqual(second);
-    expect(await store.takeEvents("realm-a", second.id)).toEqual([started.event]);
+    expect(await readEvents(database, "realm-a", second.id)).toEqual([started.event]);
     expect(
       await store.endConnect("realm-a", "new-session-nonce", second.id, started.attempt.id),
     ).toEqual({ status: "fallback", addresses: UPDATED_ADDRESSES });
@@ -263,7 +295,7 @@ describe("RealmStore", () => {
       canceledAttempts: [canceled.attempt],
     });
     expect(await store.session("realm-a", second.id)).toBeNull();
-    expect(await store.takeEvents("realm-a", second.id)).toEqual([]);
+    expect(await readEvents(database, "realm-a", second.id)).toEqual([]);
     expect(
       await store.endConnect("realm-a", "cancel-on-deregister", second.id, canceled.attempt.id),
     ).toEqual({ status: "missing" });
@@ -285,11 +317,11 @@ describe("RealmStore", () => {
       data: { ttl: 60 },
       createdAt: Date.now(),
     });
-    expect(await store.takeEvents("realm-a", session.id)).toEqual([renewed.event]);
+    expect(await readEvents(database, "realm-a", session.id)).toEqual([renewed.event]);
 
     expect(await store.heartbeat("realm-a", "wrong-token", FRESH_ADDRESSES)).toBeNull();
     expect(await store.heartbeat("realm-b", session.id, FRESH_ADDRESSES)).toBeNull();
-    expect(await store.takeEvents("realm-a", session.id)).toEqual([renewed.event]);
+    expect(await readEvents(database, "realm-a", session.id)).toEqual([renewed.event]);
 
     vi.advanceTimersByTime(1_000);
     const updated = await store.heartbeat("realm-a", session.id, UPDATED_ADDRESSES);
@@ -299,12 +331,12 @@ describe("RealmStore", () => {
       expiresAt: Date.now() + SESSION_TTL_MS,
     });
     expect(await store.session("realm-a", session.id)).toEqual(updated?.session);
-    expect(await store.takeEvents("realm-a", session.id)).toEqual([renewed.event, updated?.event]);
+    expect(await readEvents(database, "realm-a", session.id)).toEqual([renewed.event, updated?.event]);
 
     vi.advanceTimersByTime(SESSION_TTL_MS + 1);
     expect(await store.heartbeat("realm-a", session.id)).toBeNull();
     expect(await store.session("realm-a", session.id)).toBeNull();
-    expect(await store.takeEvents("realm-a", session.id)).toHaveLength(2);
+    expect(await readEvents(database, "realm-a", session.id)).toHaveLength(2);
   });
 
   it("enforces duplicate nonce and the concurrent 16-attempt cap per realm", async () => {
@@ -319,21 +351,23 @@ describe("RealmStore", () => {
     expect(results.filter((result) => result.status === "ok")).toHaveLength(MAX_PENDING_ATTEMPTS);
     expect(results.filter((result) => result.status === "rate_limited")).toHaveLength(1);
     expect(await store.beginConnect("realm-a", "nonce-0", PUNCH)).toEqual({ status: "rate_limited" });
-    expect(await store.takeEvents("realm-a", session.id)).toHaveLength(MAX_PENDING_ATTEMPTS);
+    expect(await readEvents(database, "realm-a", session.id)).toHaveLength(MAX_PENDING_ATTEMPTS);
     expect(await store.beginConnect("realm-b", "nonce-0", PUNCH)).toMatchObject({ status: "ok" });
 
     const first = results[0];
     if (first.status !== "ok") throw new Error("first attempt failed");
     await store.cancelConnect("realm-a", "nonce-0", first.attempt.id);
-    await store.deleteEvents([first.event.id]);
+    await database.prepare("DELETE FROM realm_events WHERE id = ?").bind(first.event.id).run();
     expect(await beginOk(store, "realm-a", "replacement-nonce")).toMatchObject({ session });
 
     vi.advanceTimersByTime(CONNECT_RESPONSE_TIMEOUT_MS + 1);
     expect(
       await store.recordConnectResponse("realm-a", session.id, "nonce-1", FRESH_ADDRESSES),
     ).toEqual({ status: "attempt_not_found" });
-    const events = await store.takeEvents("realm-a", session.id);
-    await store.deleteEvents(events.map((event) => event.id));
+    await database
+      .prepare("DELETE FROM realm_events WHERE realm_id = ? AND session_id = ?")
+      .bind("realm-a", session.id)
+      .run();
     expect((await beginOk(store, "realm-a", "nonce-0")).attempt.id).not.toBe(first.attempt.id);
   });
 
@@ -444,7 +478,7 @@ describe("RealmStore", () => {
     ).toEqual({ status: "response", addresses: FRESH_ADDRESSES });
   });
 
-  it("takes events in sequence order and deletes only requested IDs", async () => {
+  it("reads events in sequence order with realm and session isolation", async () => {
     const first = await registerOk(store, "realm-a");
     const second = await registerOk(store, "realm-b", UPDATED_ADDRESSES, OTHER_OWNER_IP);
     const firstHeartbeat = await store.heartbeat("realm-a", first.id);
@@ -457,10 +491,10 @@ describe("RealmStore", () => {
 
     const firstEvents = [firstHeartbeat?.event, firstPunch.event];
     const secondEvents = [secondHeartbeat?.event, secondPunch.event];
-    expect(await store.takeEvents("realm-a", first.id)).toEqual(firstEvents);
-    expect(await store.takeEvents("realm-b", second.id)).toEqual(secondEvents);
-    expect(await store.takeEvents("realm-a", second.id)).toEqual([]);
-    expect(await store.takeEvents("realm-b", first.id)).toEqual([]);
+    expect(await readEvents(database, "realm-a", first.id)).toEqual(firstEvents);
+    expect(await readEvents(database, "realm-b", second.id)).toEqual(secondEvents);
+    expect(await readEvents(database, "realm-a", second.id)).toEqual([]);
+    expect(await readEvents(database, "realm-b", first.id)).toEqual([]);
     expect(firstPunch.event.data).toEqual({
       addresses: PUNCH.addresses,
       nonce: "nonce-a",
@@ -471,19 +505,6 @@ describe("RealmStore", () => {
       nonce: "nonce-b",
       obfs: PUNCH.obfs,
     });
-
-    const prepareCalls = database.prepareCalls;
-    await store.deleteEvents([]);
-    expect(database.prepareCalls).toBe(prepareCalls);
-
-    const heartbeatIds = [firstHeartbeat?.event?.id, secondHeartbeat?.event?.id];
-    expect(heartbeatIds.every((id): id is string => typeof id === "string")).toBe(true);
-    await store.deleteEvents(heartbeatIds as string[]);
-    expect(await store.takeEvents("realm-a", first.id)).toEqual([firstPunch.event]);
-    expect(await store.takeEvents("realm-b", second.id)).toEqual([secondPunch.event]);
-    await store.deleteEvents([firstPunch.event.id, secondPunch.event.id]);
-    expect(await store.takeEvents("realm-a", first.id)).toEqual([]);
-    expect(await store.takeEvents("realm-b", second.id)).toEqual([]);
   });
 
   it("allows only the current stream lease to claim events", async () => {
@@ -520,7 +541,7 @@ describe("RealmStore", () => {
       { status: "ok", event: secondHeartbeat.event },
       { status: "ok", event: null },
     ]);
-    expect(await store.takeEvents("realm-a", session.id)).toEqual([]);
+    expect(await readEvents(database, "realm-a", session.id)).toEqual([]);
 
     const thirdHeartbeat = await store.heartbeat("realm-a", session.id);
     const fourthHeartbeat = await store.heartbeat("realm-a", session.id);
@@ -558,14 +579,14 @@ describe("RealmStore", () => {
         .bind(`event-${index}`, session.realmId, session.id, JSON.stringify({ index }), NOW + index)
         .run();
     }
-    const allEvents = await store.takeEvents("realm-a", session.id);
+    const allEvents = await readEvents(database, "realm-a", session.id);
     await store.openEventStream("realm-a", session.id, "stream-a");
 
     expect(await store.claimEvents("realm-a", session.id, "stream-a")).toEqual({
       status: "ok",
       events: allEvents.slice(0, EVENTS_BUFFER_SIZE),
     });
-    expect(await store.takeEvents("realm-a", session.id)).toEqual(allEvents.slice(EVENTS_BUFFER_SIZE));
+    expect(await readEvents(database, "realm-a", session.id)).toEqual(allEvents.slice(EVENTS_BUFFER_SIZE));
     expect(await store.claimEvents("realm-a", session.id, "stream-a")).toEqual({
       status: "ok",
       events: allEvents.slice(EVENTS_BUFFER_SIZE),
@@ -598,7 +619,7 @@ describe("RealmStore", () => {
     expect(await store.beginConnect("realm-a", "full-outbox", PUNCH)).toEqual({
       status: "rate_limited",
     });
-    expect(await store.takeEvents("realm-a", session.id)).toEqual(events);
+    expect(await readEvents(database, "realm-a", session.id)).toEqual(events);
     expect(
       await database
         .prepare("SELECT COUNT(*) AS count FROM connect_attempts WHERE realm_id = ?")
@@ -733,8 +754,8 @@ describe("RealmStore", () => {
     expect(await store.cleanupExpired()).toBe(0);
     expect(await store.session("realm-a", first.id)).toEqual(first);
     expect(await store.session("realm-b", second.id)).toEqual(second);
-    expect(await store.takeEvents("realm-a", first.id)).toHaveLength(1);
-    expect(await store.takeEvents("realm-b", second.id)).toHaveLength(1);
+    expect(await readEvents(database, "realm-a", first.id)).toHaveLength(1);
+    expect(await readEvents(database, "realm-b", second.id)).toHaveLength(1);
 
     const third = await registerOk(store, "realm-c", FRESH_ADDRESSES);
     await store.heartbeat("realm-c", third.id);
@@ -742,13 +763,13 @@ describe("RealmStore", () => {
     expect(await store.cleanupExpired(NOW + SESSION_TTL_MS + 1)).toBe(4);
     expect(await store.session("realm-a", first.id)).toBeNull();
     expect(await store.session("realm-b", second.id)).toBeNull();
-    expect(await store.takeEvents("realm-a", first.id)).toEqual([]);
-    expect(await store.takeEvents("realm-b", second.id)).toEqual([]);
+    expect(await readEvents(database, "realm-a", first.id)).toEqual([]);
+    expect(await readEvents(database, "realm-b", second.id)).toEqual([]);
     expect(await store.session("realm-c", third.id)).toEqual(third);
 
     vi.advanceTimersByTime(CONNECT_RESPONSE_TIMEOUT_MS);
     expect(await store.cleanupExpired()).toBe(4);
     expect(await store.session("realm-c", third.id)).toBeNull();
-    expect(await store.takeEvents("realm-c", third.id)).toEqual([]);
+    expect(await readEvents(database, "realm-c", third.id)).toEqual([]);
   });
 });

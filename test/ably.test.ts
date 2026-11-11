@@ -73,7 +73,7 @@ describe("AblyClient", () => {
     });
   });
 
-  it("subscribes without exposing the key in the URL and forwards resume state", async () => {
+  it("subscribes without exposing the key in the URL or sending resume state", async () => {
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.close();
@@ -83,10 +83,7 @@ describe("AblyClient", () => {
     const client = new AblyClient(API_KEY, fetchMock);
     const controller = new AbortController();
 
-    const response = await client.subscribe("hysteria:session:realm:session", {
-      signal: controller.signal,
-      lastEventId: "event 1",
-    });
+    const response = await client.subscribe("hysteria:session:realm:session", controller.signal);
 
     expect(response.body).not.toBeNull();
     const [input, init] = fetchMock.mock.calls[0];
@@ -95,7 +92,7 @@ describe("AblyClient", () => {
     expect(url.pathname).toBe("/sse");
     expect(url.searchParams.get("channels")).toBe("hysteria:session:realm:session");
     expect(url.searchParams.get("v")).toBe("1.2");
-    expect(url.searchParams.get("lastEvent")).toBe("event 1");
+    expect(url.searchParams.has("lastEvent")).toBe(false);
     expect(url.toString()).not.toContain(API_KEY);
     expect(url.toString()).not.toContain(encodeURIComponent(API_KEY));
     expect(init?.method).toBe("GET");
@@ -132,7 +129,7 @@ describe("readAblyMessages", () => {
     const response = responseFromBytes(splitEvery(new TextEncoder().encode(payload), 5));
 
     await expect(collect(response)).resolves.toEqual([
-      { id: "event-1", name: "greeting", data: { text: "你好" } },
+      { name: "greeting", data: { text: "你好" } },
     ]);
   });
 
@@ -144,8 +141,8 @@ describe("readAblyMessages", () => {
     const response = responseFromBytes([new TextEncoder().encode(payload)]);
 
     await expect(collect(response)).resolves.toEqual([
-      { id: "1", name: "remote", data: { foo: 1 } },
-      { id: "2", name: "local", data: { bar: 2 } },
+      { name: "remote", data: { foo: 1 } },
+      { name: "local", data: { bar: 2 } },
     ]);
   });
 
