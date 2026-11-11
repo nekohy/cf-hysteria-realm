@@ -2,6 +2,9 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "cf-hysteria-realm",
   "main": "src/index.ts",
+  "rules": [
+    { "type": "Text", "globs": ["**/*.sql"], "fallthrough": true }
+  ],
   "compatibility_date": "2026-05-30",
   "compatibility_flags": ["enable_request_signal"],
   "workers_dev": true,

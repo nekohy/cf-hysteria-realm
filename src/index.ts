@@ -17,6 +17,7 @@ import {
   validateNonce,
   validateObfs,
 } from "./protocol";
+import { ensureSchema } from "./schema";
 import {
   CONNECT_RESPONSE_TIMEOUT_MS,
   RealmStore,
@@ -63,6 +64,7 @@ export default {
     }
     if (!env.REALM_TOKEN) return errorResponse(500, "bad_request", "REALM_TOKEN is not configured");
     if (!env.ABLY_API_KEY) return errorResponse(500, "bad_request", "ABLY_API_KEY is not configured");
+    if (!env.DB) return errorResponse(500, "bad_request", "DB binding is not configured");
     if (route.kind === "methodNotAllowed") return errorResponse(405, "bad_request", "method not allowed");
 
     const app: App = {
@@ -73,6 +75,7 @@ export default {
     };
 
     try {
+      await ensureSchema(env.DB);
       switch (route.kind) {
         case "register":
           return await register(request, app, route);
@@ -97,6 +100,7 @@ export default {
   },
 
   async scheduled(_event: ScheduledController, env: Env): Promise<void> {
+    await ensureSchema(env.DB);
     const deleted = await new RealmStore(env.DB).cleanupExpired();
     debug(env, `expired cleanup deleted=${deleted}`);
   },
@@ -109,6 +113,7 @@ async function metrics(request: Request, env: Env): Promise<Response> {
     return errorResponse(401, "invalid_token", "invalid metrics token");
   }
 
+  await ensureSchema(env.DB);
   const values = await new RealmStore(env.DB).metrics();
   const body = [
     "# TYPE hysteria_realm_realms_registered gauge",
