@@ -1,1 +1,2 @@
 REALM_TOKEN=replace-with-a-long-random-token
+ABLY_API_KEY=your-app-id.key-id:key-secret

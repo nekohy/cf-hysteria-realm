@@ -1,602 +1,539 @@
-import { DurableObject } from "cloudflare:workers";
+import {
+  AblyClient,
+  AblyError,
+  attemptChannel,
+  encodeSseEvent,
+  readAblyMessages,
+  sessionChannel,
+} from "./ably";
+import {
+  bearer,
+  errorResponse,
+  isValidRealmId,
+  jsonResponse,
+  normalizeIpAddress,
+  parseRoute,
+  readJson,
+  validateAddresses,
+  validateNonce,
+  validateObfs,
+} from "./protocol";
+import {
+  CONNECT_RESPONSE_TIMEOUT_MS,
+  RealmStore,
+  SESSION_TTL_MS,
+  type StoredAttempt,
+  type StoredEvent,
+  type StoredSession,
+} from "./store";
+
+const SSE_KEEPALIVE_MS = 15_000;
+const MAX_D1_OPERATIONS_PER_STREAM = 40;
 
 export interface Env {
-  REALM: DurableObjectNamespace<SingleRealm>;
-  REALM_ID: string;
+  DB: D1Database;
   REALM_TOKEN: string;
+  ABLY_API_KEY: string;
   REALM_NAME_PATTERN?: string;
+  MAX_REALMS?: string;
+  MAX_REALMS_PER_IP?: string;
+  TRUSTED_PROXY_HEADER?: string;
+  METRICS_TOKEN?: string;
   DEBUG?: string;
 }
 
-const SESSION_TTL_MS = 60_000;
-const CONNECT_RESPONSE_TIMEOUT_MS = 10_000;
-const EVENTS_BUFFER_SIZE = 16;
-const MAX_PENDING_ATTEMPTS = EVENTS_BUFFER_SIZE;
-const MAX_REQUEST_BODY_BYTES = 4 << 10;
-const MAX_ADDRESSES = 8;
-const SSE_KEEPALIVE_MS = 15_000;
-const NONCE_HEX_LENGTH = 32;
-const OBFS_HEX_LENGTH = 64;
-const DEFAULT_REALM_NAME_PATTERN = "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$";
-
-type StoredSession = {
-  id: string;
-  realmId: string;
-  addresses: string[];
-  expiresAt: number;
+type App = {
+  env: Env;
+  ctx: ExecutionContext;
+  store: RealmStore;
+  ably: AblyClient;
 };
-
-type PendingAttempt = {
-  resolve: (addresses: string[] | null) => void;
-  timer: ReturnType<typeof setTimeout>;
-};
-
-type Route =
-  | { kind: "register" | "deregister" | "events" | "heartbeat" | "connect"; realmId: string }
-  | { kind: "connectResponse"; realmId: string; nonce: string };
-
-type RouteResult =
-  | Route
-  | { kind: "badRequest"; message: string }
-  | { kind: "methodNotAllowed"; realmId: string };
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const id = env.REALM.idFromName("single");
-    const stub = env.REALM.get(id);
-    return stub.fetch(request);
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === "/metrics") {
+      try {
+        return await metrics(request, env);
+      } catch (error) {
+        debug(env, "metrics failed", error);
+        return errorResponse(500, "internal_error", "internal server error");
+      }
+    }
+    const route = parseRoute(url.pathname, request.method);
+    if (!route) return errorResponse(404, "not_found", "unknown path");
+    if (route.kind === "badRequest") return errorResponse(400, "bad_request", route.message);
+    let validRealmId: boolean;
+    try {
+      validRealmId = isValidRealmId(route.realmId, env.REALM_NAME_PATTERN);
+    } catch {
+      return errorResponse(500, "bad_request", "invalid REALM_NAME_PATTERN");
+    }
+    if (!validRealmId) return errorResponse(400, "bad_request", "invalid realm name");
+    if (!env.REALM_TOKEN) return errorResponse(500, "bad_request", "REALM_TOKEN is not configured");
+    if (!env.ABLY_API_KEY) return errorResponse(500, "bad_request", "ABLY_API_KEY is not configured");
+    if (route.kind === "methodNotAllowed") return errorResponse(405, "bad_request", "method not allowed");
+
+    const app: App = {
+      env,
+      ctx,
+      store: new RealmStore(env.DB),
+      ably: new AblyClient(env.ABLY_API_KEY),
+    };
+
+    try {
+      switch (route.kind) {
+        case "register":
+          return await register(request, app, route);
+        case "deregister":
+          return await deregister(request, app, route);
+        case "events":
+          return await events(request, app, route);
+        case "heartbeat":
+          return await heartbeat(request, app, route);
+        case "connect":
+          return await connect(request, app, route);
+        case "connectResponse":
+          return await connectResponse(request, app, route);
+      }
+    } catch (error) {
+      debug(env, "request failed", error);
+      if (error instanceof AblyError) {
+        return errorResponse(502, "bad_gateway", "realtime service unavailable");
+      }
+      return errorResponse(500, "internal_error", "internal server error");
+    }
+  },
+
+  async scheduled(_event: ScheduledController, env: Env): Promise<void> {
+    const deleted = await new RealmStore(env.DB).cleanupExpired();
+    debug(env, `expired cleanup deleted=${deleted}`);
   },
 };
 
-export class SingleRealm extends DurableObject<Env> {
-  private session: StoredSession | null = null;
-  private eventWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
-  private eventKeepalive: ReturnType<typeof setInterval> | null = null;
-  private eventQueue: string[] = [];
-  private pending = new Map<string, PendingAttempt>();
-
-  async fetch(request: Request): Promise<Response> {
-    const route = parseRoute(new URL(request.url).pathname, request.method);
-    if (!route) {
-      return errorResponse(404, "not_found", "unknown path");
-    }
-    if (route.kind === "badRequest") {
-      return errorResponse(400, "bad_request", route.message);
-    }
-
-    const namePattern = this.env.REALM_NAME_PATTERN || DEFAULT_REALM_NAME_PATTERN;
-    if (!new RegExp(namePattern).test(route.realmId)) {
-      return errorResponse(400, "bad_request", "invalid realm name");
-    }
-    if (route.realmId !== this.env.REALM_ID) {
-      this.debug(
-        "realm id mismatch request_len=%d configured_len=%d",
-        route.realmId.length,
-        this.env.REALM_ID.length,
-      );
-      return errorResponse(404, "realm_not_found", "realm not found");
-    }
-    if (!this.env.REALM_TOKEN) {
-      return errorResponse(500, "bad_request", "REALM_TOKEN is not configured");
-    }
-    if (route.kind === "methodNotAllowed") {
-      return errorResponse(405, "bad_request", "method not allowed");
-    }
-
-    switch (route.kind) {
-      case "register":
-        return this.register(request, route.realmId);
-      case "deregister":
-        return this.deregister(request, route.realmId);
-      case "events":
-        return this.events(request, route.realmId);
-      case "heartbeat":
-        return this.heartbeat(request, route.realmId);
-      case "connect":
-        return this.handleConnect(request, route.realmId);
-      case "connectResponse":
-        return this.connectResponse(request, route.realmId, route.nonce);
-    }
+async function metrics(request: Request, env: Env): Promise<Response> {
+  if (!env.METRICS_TOKEN) return errorResponse(404, "not_found", "unknown path");
+  if (request.method !== "GET") return errorResponse(405, "bad_request", "method not allowed");
+  if (bearer(request) !== env.METRICS_TOKEN) {
+    return errorResponse(401, "invalid_token", "invalid metrics token");
   }
 
-  async alarm(): Promise<void> {
-    const session = await this.getSession();
-    if (!session) {
-      this.debug("alarm fired without session");
-      return;
-    }
-    if (Date.now() > session.expiresAt) {
-      await this.clearSession();
-      this.debug("session expired realm=%s session=%s", session.realmId, session.id);
-    }
+  const values = await new RealmStore(env.DB).metrics();
+  const maxRealms = numericLimit(env.MAX_REALMS, 65_536);
+  const maxRealmsPerIp = numericLimit(env.MAX_REALMS_PER_IP, 4);
+  const body = [
+    "# TYPE hysteria_realm_realms_registered gauge",
+    `hysteria_realm_realms_registered ${values.realms}`,
+    "# TYPE hysteria_realm_sessions_active gauge",
+    `hysteria_realm_sessions_active ${values.realms}`,
+    "# TYPE hysteria_realm_pending_connects gauge",
+    `hysteria_realm_pending_connects ${values.attempts}`,
+    "# TYPE hysteria_realm_event_streams_active gauge",
+    `hysteria_realm_event_streams_active ${values.streams}`,
+    "# TYPE hysteria_realm_global_limit gauge",
+    `hysteria_realm_global_limit ${maxRealms}`,
+    "# TYPE hysteria_realm_ip_limit gauge",
+    `hysteria_realm_ip_limit ${maxRealmsPerIp}`,
+    "",
+  ].join("\n");
+  return new Response(body, {
+    status: 200,
+    headers: { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" },
+  });
+}
+
+async function register(request: Request, app: App, route: { realmId: string }): Promise<Response> {
+  if (bearer(request) !== app.env.REALM_TOKEN) return errorResponse(401, "invalid_token", "invalid realm token");
+  const body = await readJson<{ addresses?: unknown }>(request);
+  if (body instanceof Response) return body;
+  const addresses = validateAddresses(body.addresses);
+  if (typeof addresses === "string") return errorResponse(400, "bad_request", addresses);
+
+  const result = await app.store.register(
+    route.realmId,
+    addresses,
+    clientIp(request, app.env),
+    numericLimit(app.env.MAX_REALMS, 65_536),
+    numericLimit(app.env.MAX_REALMS_PER_IP, 4),
+  );
+  if (result.status === "realm_taken") {
+    return errorResponse(409, "realm_taken", "realm is already registered");
+  }
+  if (result.status === "realm_limit_reached") {
+    return errorResponse(429, "realm_limit_reached", "maximum number of realms reached");
+  }
+  if (result.status === "ip_limit_reached") {
+    return errorResponse(429, "ip_limit_reached", "maximum realms per client IP reached");
+  }
+  return jsonResponse(200, { session_id: result.session.id, ttl: SESSION_TTL_MS / 1000 });
+}
+
+async function deregister(request: Request, app: App, route: { realmId: string }): Promise<Response> {
+  const result = await app.store.deregister(route.realmId, bearer(request));
+  if (!result) return errorResponse(401, "invalid_token", "invalid session token");
+
+  await closePreviousSession(app, result.session, result.canceledAttempts);
+  return new Response(null, { status: 204 });
+}
+
+async function heartbeat(request: Request, app: App, route: { realmId: string }): Promise<Response> {
+  const body = await readJson<{ addresses?: unknown }>(request, true);
+  if (body instanceof Response) return body;
+
+  let addresses: string[] | undefined;
+  if (body.addresses !== undefined) {
+    const validated = validateAddresses(body.addresses);
+    if (typeof validated === "string") return errorResponse(400, "bad_request", validated);
+    addresses = validated;
   }
 
-  private async register(request: Request, realmId: string): Promise<Response> {
-    if (!this.checkRealmToken(request)) {
-      this.debug("register unauthorized realm=%s", realmId);
-      return errorResponse(401, "invalid_token", "invalid realm token");
-    }
-    this.debug("register requested realm=%s", realmId);
+  const result = await app.store.heartbeat(route.realmId, bearer(request), addresses);
+  if (!result) return errorResponse(401, "invalid_token", "invalid session token");
+  const { session, event } = result;
 
-    const body = await readJson<{ addresses?: unknown }>(request);
-    if (body instanceof Response) {
-      return body;
-    }
-    const addresses = body.addresses;
-    if (!Array.isArray(addresses) || !addresses.every((value) => typeof value === "string")) {
-      return errorResponse(400, "bad_request", "at least one address required");
-    }
-    const addressError = validateAddresses(addresses);
-    if (addressError) {
-      return errorResponse(400, "bad_request", addressError);
-    }
-
-    const existing = await this.getSession();
-    if (existing) {
-      this.debug("register replacing existing realm=%s session=%s", realmId, existing.id);
-      await this.clearSession();
-    }
-
-    const session: StoredSession = {
-      id: randomHex(16),
-      realmId,
-      addresses: [...addresses],
-      expiresAt: Date.now() + SESSION_TTL_MS,
-    };
-    await this.storeSession(session);
-    this.eventQueue = [];
-    this.debug("registered realm=%s session=%s addresses=%d", realmId, session.id, session.addresses.length);
-    return jsonResponse(200, { session_id: session.id, ttl: SESSION_TTL_MS / 1000 });
-  }
-
-  private async deregister(request: Request, realmId: string): Promise<Response> {
-    const session = await this.requireSession(request, realmId);
-    if (session instanceof Response) {
-      return session;
-    }
-    await this.clearSession();
-    this.debug("deregistered realm=%s session=%s", realmId, session.id);
-    return new Response(null, { status: 204 });
-  }
-
-  private async heartbeat(request: Request, realmId: string): Promise<Response> {
-    const session = await this.requireSession(request, realmId);
-    if (session instanceof Response) {
-      return session;
-    }
-
-    const body = await readJson<{ addresses?: unknown }>(request, true);
-    if (body instanceof Response) {
-      return body;
-    }
-    let addresses = session.addresses;
-    if (body.addresses !== undefined) {
-      if (!Array.isArray(body.addresses) || !body.addresses.every((value) => typeof value === "string")) {
-        return errorResponse(400, "bad_request", "at least one address required");
-      }
-      const addressError = validateAddresses(body.addresses);
-      if (addressError) {
-        return errorResponse(400, "bad_request", addressError);
-      }
-      addresses = [...body.addresses];
-    }
-
-    const updated: StoredSession = {
-      ...session,
-      addresses,
-      expiresAt: Date.now() + SESSION_TTL_MS,
-    };
-    await this.storeSession(updated);
-    this.debug("heartbeat realm=%s session=%s addressesUpdated=%s", realmId, session.id, body.addresses !== undefined ? "true" : "false");
-    this.sendEvent("heartbeat_ack", { ttl: SESSION_TTL_MS / 1000 });
-    return jsonResponse(200, { ttl: SESSION_TTL_MS / 1000 });
-  }
-
-  private async events(request: Request, realmId: string): Promise<Response> {
-    const session = await this.requireSession(request, realmId);
-    if (session instanceof Response) {
-      return session;
-    }
-
-    const stream = new TransformStream<Uint8Array, Uint8Array>();
-    const writer = stream.writable.getWriter();
-    this.closeEventWriter();
-    this.eventWriter = writer;
-    this.eventKeepalive = setInterval(() => {
-      if (this.eventWriter !== writer) {
-        return;
-      }
-      writer.write(encode(": keepalive\n\n")).catch((error) => {
-        this.debug("events keepalive failed realm=%s session=%s error=%s", realmId, session.id, String(error));
-        if (this.eventWriter === writer) {
-          this.eventWriter = null;
-        }
-        this.clearEventKeepalive();
-      });
-    }, SSE_KEEPALIVE_MS);
-
-    request.signal.addEventListener("abort", () => {
-      this.debug("events aborted realm=%s session=%s", realmId, session.id);
-      if (this.eventWriter === writer) {
-        this.eventWriter = null;
-      }
-      this.clearEventKeepalive();
-      writer.close().catch(() => undefined);
-    });
-
-    this.debug("events connected realm=%s session=%s", realmId, session.id);
-    this.flushEventWriter(writer, realmId, session.id);
-    return new Response(stream.readable, {
-      status: 200,
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-      },
+  if (event) {
+    await app.ably.publish(sessionChannel(session.realmId, session.id), "heartbeat_ack", {
+      eventId: event.id,
     });
   }
+  return jsonResponse(200, { ttl: SESSION_TTL_MS / 1000 });
+}
 
-  private async handleConnect(request: Request, realmId: string): Promise<Response> {
-    if (!this.checkRealmToken(request)) {
-      return errorResponse(401, "invalid_token", "invalid realm token");
-    }
+async function events(request: Request, app: App, route: { realmId: string }): Promise<Response> {
+  let session = await app.store.session(route.realmId, bearer(request));
+  if (!session) return errorResponse(401, "invalid_token", "invalid session token");
 
-    const body = await readJson<{ addresses?: unknown; nonce?: unknown; obfs?: unknown }>(request);
-    if (body instanceof Response) {
-      return body;
-    }
-    if (!Array.isArray(body.addresses) || !body.addresses.every((value) => typeof value === "string")) {
-      return errorResponse(400, "bad_request", "at least one address required");
-    }
-    const addressError = validateAddresses(body.addresses);
-    if (addressError) {
-      return errorResponse(400, "bad_request", addressError);
-    }
-    if (typeof body.nonce !== "string") {
-      return errorResponse(400, "bad_request", `nonce must be ${NONCE_HEX_LENGTH} hex characters`);
-    }
-    const nonceError = validateHexField("nonce", body.nonce, NONCE_HEX_LENGTH);
-    if (nonceError) {
-      return errorResponse(400, "bad_request", nonceError);
-    }
-    if (typeof body.obfs !== "string") {
-      return errorResponse(400, "bad_request", `obfs must be ${OBFS_HEX_LENGTH} hex characters`);
-    }
-    const obfsError = validateHexField("obfs", body.obfs, OBFS_HEX_LENGTH);
-    if (obfsError) {
-      return errorResponse(400, "bad_request", obfsError);
-    }
+  const abort = new AbortController();
+  const onRequestAbort = () => abort.abort();
+  request.signal.addEventListener("abort", onRequestAbort, { once: true });
+  if (request.signal.aborted) onRequestAbort();
 
-    const session = await this.getSession();
-    if (!session || session.realmId !== realmId) {
-      this.debug("connect rejected realm=%s session_present=%s", realmId, session ? "true" : "false");
-      return errorResponse(404, "realm_not_found", "realm not registered");
-    }
-    this.debug("connect requested realm=%s session=%s clientAddresses=%d", realmId, session.id, body.addresses.length);
-    if (this.pending.size >= MAX_PENDING_ATTEMPTS || this.pending.has(body.nonce)) {
-      return errorResponse(503, "rate_limited", "too many in-flight connect attempts");
-    }
-
-    const freshAddresses = new Promise<string[] | null>((resolve) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(body.nonce as string);
-        this.debug("connect response timed out realm=%s session=%s", realmId, session.id);
-        resolve([]);
-      }, CONNECT_RESPONSE_TIMEOUT_MS);
-      this.pending.set(body.nonce as string, { resolve, timer });
+  const streamId = crypto.randomUUID();
+  let upstream: Response;
+  try {
+    upstream = await app.ably.subscribe(sessionChannel(session.realmId, session.id), {
+      signal: abort.signal,
     });
-
-    const sent = this.sendEvent("punch", {
-      addresses: body.addresses,
-      nonce: body.nonce,
-      obfs: body.obfs,
-    });
-    if (!sent) {
-      const pending = this.pending.get(body.nonce);
-      if (pending) {
-        clearTimeout(pending.timer);
-        this.pending.delete(body.nonce);
-      }
-      return errorResponse(503, "rate_limited", "server event buffer full");
-    }
-    this.debug("connect punch queued realm=%s session=%s serverAddresses=%d", realmId, session.id, session.addresses.length);
-
-    const addresses = await freshAddresses;
-    if (addresses === null) {
-      this.debug("connect canceled realm=%s session=%s", realmId, session.id);
-      return errorResponse(404, "realm_not_found", "realm not registered");
-    }
-    this.debug("connect returning realm=%s session=%s freshAddresses=%d", realmId, session.id, addresses.length);
-    return jsonResponse(200, {
-      addresses: addresses.length > 0 ? addresses : session.addresses,
-      nonce: body.nonce,
-      obfs: body.obfs,
-    });
-  }
-
-  private async connectResponse(request: Request, realmId: string, nonce: string): Promise<Response> {
-    const nonceError = validateHexField("nonce", nonce, NONCE_HEX_LENGTH);
-    if (nonceError) {
-      return errorResponse(400, "bad_request", nonceError);
-    }
-    const session = await this.requireSession(request, realmId);
-    if (session instanceof Response) {
-      return session;
-    }
-
-    const body = await readJson<{ addresses?: unknown }>(request);
-    if (body instanceof Response) {
-      return body;
-    }
-    if (!Array.isArray(body.addresses) || !body.addresses.every((value) => typeof value === "string")) {
-      return errorResponse(400, "bad_request", "at least one address required");
-    }
-    const addressError = validateAddresses(body.addresses);
-    if (addressError) {
-      return errorResponse(400, "bad_request", addressError);
-    }
-
-    const pending = this.pending.get(nonce);
-    if (!pending) {
-      this.debug("connect-response no pending realm=%s session=%s", realmId, session.id);
-      return errorResponse(404, "attempt_not_found", "no pending attempt for nonce");
-    }
-    clearTimeout(pending.timer);
-    this.pending.delete(nonce);
-    pending.resolve([...body.addresses]);
-    this.debug("connect-response delivered realm=%s session=%s addresses=%d", realmId, session.id, body.addresses.length);
-    return new Response(null, { status: 204 });
-  }
-
-  private async requireSession(request: Request, realmId: string): Promise<StoredSession | Response> {
-    const session = await this.getSession();
-    if (!session || session.realmId !== realmId || bearer(request) !== session.id) {
+    const leasedSession = await app.store.openEventStream(session.realmId, session.id, streamId);
+    if (!leasedSession) {
+      abort.abort();
+      request.signal.removeEventListener("abort", onRequestAbort);
       return errorResponse(401, "invalid_token", "invalid session token");
     }
-    return session;
+    session = leasedSession;
+  } catch (error) {
+    abort.abort();
+    request.signal.removeEventListener("abort", onRequestAbort);
+    throw error;
   }
 
-  private async getSession(): Promise<StoredSession | null> {
-    if (this.session && Date.now() > this.session.expiresAt) {
-      await this.clearSession();
-      return null;
-    }
-    return this.session;
-  }
+  let pump: Promise<void>;
+  const readable = new ReadableStream<Uint8Array>({
+    start(output) {
+      output.enqueue(encode(": connected\n\n"));
+      pump = pumpEvents(output, upstream, session, streamId, request, app, abort, onRequestAbort);
+    },
+    cancel() {
+      abort.abort();
+    },
+  });
+  app.ctx.waitUntil(pump!);
 
-  private async storeSession(session: StoredSession): Promise<void> {
-    this.session = session;
-    await this.ctx.storage.setAlarm(session.expiresAt + 1_000);
-  }
+  return new Response(readable, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+    },
+  });
+}
 
-  private async clearSession(): Promise<void> {
-    this.session = null;
-    await this.ctx.storage.deleteAlarm();
-    for (const [nonce, pending] of this.pending) {
-      clearTimeout(pending.timer);
-      pending.resolve(null);
-      this.pending.delete(nonce);
-    }
-    this.eventQueue = [];
-    this.closeEventWriter();
-  }
+async function pumpEvents(
+  output: ReadableStreamDefaultController<Uint8Array>,
+  upstream: Response,
+  session: StoredSession,
+  streamId: string,
+  request: Request,
+  app: App,
+  abort: AbortController,
+  onRequestAbort: () => void,
+): Promise<void> {
+  let expiryTimer: ReturnType<typeof setTimeout> | undefined;
+  let keepalive: ReturnType<typeof setInterval> | undefined;
+  let closed = false;
+  let currentExpiry = session.expiresAt;
+  let d1Operations = 0;
 
-  private closeEventWriter(): void {
-    this.clearEventKeepalive();
-    const writer = this.eventWriter;
-    this.eventWriter = null;
-    if (writer) {
-      writer.close().catch(() => undefined);
-    }
-  }
-
-  private async flushEventWriter(
-    writer: WritableStreamDefaultWriter<Uint8Array>,
-    realmId: string,
-    sessionId: string,
-  ): Promise<void> {
+  const close = () => {
+    if (closed) return;
+    closed = true;
     try {
-      await writer.write(encode(": connected\n\n"));
-      while (this.eventWriter === writer && this.eventQueue.length > 0) {
-        const event = this.eventQueue.shift();
-        if (event) {
-          await writer.write(encode(event));
+      output.close();
+    } catch {
+      // The client may already have canceled the response.
+    }
+  };
+  const armExpiry = () => {
+    if (expiryTimer) clearTimeout(expiryTimer);
+    expiryTimer = setTimeout(() => abort.abort(), Math.max(0, currentExpiry - Date.now()));
+  };
+  const writeEvent = (event: StoredEvent): void => {
+    if (abort.signal.aborted) return;
+    if (event.name === "heartbeat_ack") {
+      const ttl = (event.data as { ttl?: unknown } | null)?.ttl;
+      if (typeof ttl === "number" && Number.isFinite(ttl) && ttl > 0) {
+        currentExpiry = Math.max(currentExpiry, event.createdAt + ttl * 1000);
+        armExpiry();
+      }
+    }
+    output.enqueue(encode(encodeSseEvent(event.name, event.data, event.id)));
+  };
+
+  try {
+    armExpiry();
+    keepalive = setInterval(() => {
+      if (closed || abort.signal.aborted) return;
+      try {
+        output.enqueue(encode(": keepalive\n\n"));
+      } catch {
+        abort.abort();
+      }
+    }, SSE_KEEPALIVE_MS);
+
+    // Subscribe before claiming the outbox so the subscribe/backlog gap is covered.
+    const backlog = await app.store.claimEvents(session.realmId, session.id, streamId);
+    d1Operations += 1;
+    if (backlog.status === "not_owner") {
+      close();
+      return;
+    }
+    for (const event of backlog.events) writeEvent(event);
+
+    for await (const message of readAblyMessages(upstream, abort.signal)) {
+      if (message.name === "session_closed") break;
+      if (message.name !== "punch" && message.name !== "heartbeat_ack") continue;
+      const claimed = await app.store.claimEvent(
+        session.realmId,
+        session.id,
+        streamId,
+        decodeEventId(message.data),
+      );
+      d1Operations += 1;
+      if (claimed.status === "not_owner") break;
+      if (claimed.event) writeEvent(claimed.event);
+      // Reconnect before approaching the Free plan's 50 D1 queries/invocation limit.
+      if (d1Operations >= MAX_D1_OPERATIONS_PER_STREAM) break;
+    }
+    close();
+  } catch (error) {
+    if (abort.signal.aborted) {
+      close();
+    } else {
+      debug(app.env, "event stream failed", error);
+      closed = true;
+      output.error(error);
+    }
+  } finally {
+    if (expiryTimer) clearTimeout(expiryTimer);
+    if (keepalive) clearInterval(keepalive);
+    abort.abort();
+    request.signal.removeEventListener("abort", onRequestAbort);
+    await app.store.closeEventStream(session.realmId, session.id, streamId).catch((error) => {
+      debug(app.env, "event stream lease cleanup failed", error);
+    });
+  }
+}
+
+function decodeEventId(value: unknown): string {
+  const eventId = (value as { eventId?: unknown } | null)?.eventId;
+  if (typeof eventId !== "string" || !eventId) {
+    throw new AblyError("Ably event notification is malformed");
+  }
+  return eventId;
+}
+
+async function connect(request: Request, app: App, route: { realmId: string }): Promise<Response> {
+  if (bearer(request) !== app.env.REALM_TOKEN) return errorResponse(401, "invalid_token", "invalid realm token");
+  const body = await readJson<{ addresses?: unknown; nonce?: unknown; obfs?: unknown }>(request);
+  if (body instanceof Response) return body;
+
+  const addresses = validateAddresses(body.addresses);
+  if (typeof addresses === "string") return errorResponse(400, "bad_request", addresses);
+  const nonceError = validateNonce(body.nonce);
+  if (nonceError) return errorResponse(400, "bad_request", nonceError);
+  const obfsError = validateObfs(body.obfs);
+  if (obfsError) return errorResponse(400, "bad_request", obfsError);
+  const nonce = body.nonce as string;
+  const obfs = body.obfs as string;
+
+  const started = await app.store.beginConnect(route.realmId, nonce, { addresses, obfs });
+  if (started.status === "no_session") return errorResponse(404, "realm_not_found", "realm not registered");
+  if (started.status === "rate_limited") {
+    return errorResponse(503, "rate_limited", "too many in-flight connect attempts");
+  }
+
+  const session = started.session;
+  const attempt = started.attempt;
+  const event = started.event;
+  const abort = new AbortController();
+  const onRequestAbort = () => abort.abort();
+  request.signal.addEventListener("abort", onRequestAbort, { once: true });
+  if (request.signal.aborted) onRequestAbort();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<void>((resolve) => {
+    timeout = setTimeout(() => {
+      abort.abort();
+      resolve();
+    }, CONNECT_RESPONSE_TIMEOUT_MS);
+  });
+
+  try {
+    const notifyAndWait = async (): Promise<void> => {
+      let upstream: Response | null;
+      try {
+        upstream = await app.ably.subscribe(attemptChannel(route.realmId, session.id, attempt.id), {
+          signal: abort.signal,
+        });
+        await app.ably.publish(sessionChannel(route.realmId, session.id), "punch", {
+          eventId: event.id,
+        }, abort.signal);
+      } catch (error) {
+        if (!abort.signal.aborted) {
+          await app.store.cancelConnect(route.realmId, nonce, attempt.id).catch(() => undefined);
+        }
+        throw error;
+      }
+
+      while (!abort.signal.aborted) {
+        try {
+          upstream ??= await app.ably.subscribe(attemptChannel(route.realmId, session.id, attempt.id), {
+            signal: abort.signal,
+          });
+          await waitForAttemptSignal(upstream, abort.signal);
+          return;
+        } catch (error) {
+          if (abort.signal.aborted) return;
+          debug(app.env, "connect notification failed; resubscribing", error);
+          upstream = null;
+          await retryDelay(250, abort.signal);
         }
       }
-    } catch (error) {
-      this.debug("events flush failed realm=%s session=%s error=%s", realmId, sessionId, String(error));
-      if (this.eventWriter === writer) {
-        this.eventWriter = null;
-      }
-      this.clearEventKeepalive();
-    }
-  }
+    };
+    await Promise.race([notifyAndWait(), timeoutPromise]);
 
-  private clearEventKeepalive(): void {
-    if (this.eventKeepalive) {
-      clearInterval(this.eventKeepalive);
-      this.eventKeepalive = null;
-    }
-  }
-
-  private sendEvent(kind: string, data: unknown): boolean {
-    const payload = `event: ${kind}\ndata: ${JSON.stringify(data)}\n\n`;
-    if (this.eventWriter) {
-      const writer = this.eventWriter;
-      writer.write(encode(payload)).catch((error) => {
-        this.debug("event write failed kind=%s error=%s", kind, String(error));
-        if (this.eventWriter === writer) {
-          this.eventWriter = null;
-        }
-      });
-      return true;
-    }
-    if (this.eventQueue.length >= EVENTS_BUFFER_SIZE) {
-      return false;
-    }
-    this.eventQueue.push(payload);
-    return true;
-  }
-
-  private checkRealmToken(request: Request): boolean {
-    return bearer(request) === this.env.REALM_TOKEN;
-  }
-
-  private debug(message: string, ...args: unknown[]): void {
-    if (this.env.DEBUG === "true") {
-      console.log(message, ...args);
-    }
+    const ended = await app.store.endConnect(route.realmId, nonce, session.id, attempt.id);
+    if (ended.status === "missing") return errorResponse(404, "realm_not_found", "realm not registered");
+    return jsonResponse(200, { addresses: ended.addresses, nonce, obfs });
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    abort.abort();
+    request.signal.removeEventListener("abort", onRequestAbort);
   }
 }
 
-function parseRoute(pathname: string, method: string): RouteResult | null {
-  const parts = pathname.split("/").filter(Boolean);
-  if (parts.length < 2 || parts[0] !== "v1") {
-    return null;
+async function waitForAttemptSignal(upstream: Response, signal: AbortSignal): Promise<void> {
+  for await (const message of readAblyMessages(upstream, signal)) {
+    if (message.name === "connect_response" || message.name === "connect_cancel") return;
   }
-  let realmId: string;
+  throw new AblyError("Ably attempt stream closed before a response arrived");
+}
+
+async function retryDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(done, milliseconds);
+    function done(): void {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    }
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
+
+async function connectResponse(
+  request: Request,
+  app: App,
+  route: { realmId: string; nonce: string },
+): Promise<Response> {
+  const nonceError = validateNonce(route.nonce);
+  if (nonceError) return errorResponse(400, "bad_request", nonceError);
+  const body = await readJson<{ addresses?: unknown }>(request);
+  if (body instanceof Response) return body;
+  const addresses = validateAddresses(body.addresses);
+  if (typeof addresses === "string") return errorResponse(400, "bad_request", addresses);
+
+  const result = await app.store.recordConnectResponse(
+    route.realmId,
+    bearer(request),
+    route.nonce,
+    addresses,
+  );
+  if (result.status === "no_session") return errorResponse(401, "invalid_token", "invalid session token");
+  if (result.status === "attempt_not_found") {
+    return errorResponse(404, "attempt_not_found", "no pending attempt for nonce");
+  }
+
+  await app.ably.publish(
+    attemptChannel(route.realmId, result.attempt.sessionId, result.attempt.id),
+    "connect_response",
+    { nonce: route.nonce },
+  );
+  return new Response(null, { status: 204 });
+}
+
+async function closePreviousSession(
+  app: App,
+  session: StoredSession | null,
+  canceledAttempts: StoredAttempt[],
+): Promise<void> {
+  if (!session) return;
   try {
-    realmId = decodeURIComponent(parts[1]);
-  } catch {
-    return { kind: "badRequest", message: "invalid realm name" };
-  }
-  if (parts.length === 2) {
-    if (method === "POST") {
-      return { kind: "register", realmId };
+    await app.ably.publish(sessionChannel(session.realmId, session.id), "session_closed", {});
+    for (const attempt of canceledAttempts) {
+      await app.ably.publish(
+        attemptChannel(session.realmId, session.id, attempt.id),
+        "connect_cancel",
+        { nonce: attempt.nonce },
+      );
     }
-    if (method === "DELETE") {
-      return { kind: "deregister", realmId };
-    }
-    return { kind: "methodNotAllowed", realmId };
-  }
-  if (parts.length === 3) {
-    if (parts[2] === "events") {
-      return method === "GET" ? { kind: "events", realmId } : { kind: "methodNotAllowed", realmId };
-    }
-    if (parts[2] === "heartbeat") {
-      return method === "POST" ? { kind: "heartbeat", realmId } : { kind: "methodNotAllowed", realmId };
-    }
-    if (parts[2] === "connect") {
-      return method === "POST" ? { kind: "connect", realmId } : { kind: "methodNotAllowed", realmId };
-    }
-  }
-  if (parts.length === 4 && parts[2] === "connects") {
-    return method === "POST"
-      ? { kind: "connectResponse", realmId, nonce: parts[3] }
-      : { kind: "methodNotAllowed", realmId };
-  }
-  return null;
-}
-
-async function readJson<T>(request: Request, allowEmpty = false): Promise<T | Response> {
-  const bytes = await request.arrayBuffer();
-  if (bytes.byteLength > MAX_REQUEST_BODY_BYTES) {
-    return errorResponse(400, "bad_request", "request body too large");
-  }
-  if (bytes.byteLength === 0 && allowEmpty) {
-    return {} as T;
-  }
-  try {
-    return JSON.parse(new TextDecoder().decode(bytes)) as T;
-  } catch {
-    return errorResponse(400, "bad_request", "invalid json");
+  } catch (error) {
+    // TTL checks and endConnect still provide correct behavior if cancellation is lost.
+    debug(app.env, "session cancellation publish failed", error);
   }
 }
 
-function validateAddresses(addresses: string[]): string | null {
-  if (addresses.length === 0) {
-    return "at least one address required";
-  }
-  if (addresses.length > MAX_ADDRESSES) {
-    return `too many addresses (max ${MAX_ADDRESSES})`;
-  }
-  for (const address of addresses) {
-    if (!isAddressPort(address)) {
-      return `invalid address: ${address}`;
-    }
-  }
-  return null;
+function numericLimit(value: string | undefined, fallback: number): number {
+  if (value === undefined || value === "") return fallback;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
-function isAddressPort(value: string): boolean {
-  let host = "";
-  let portText = "";
-  if (value.startsWith("[")) {
-    const end = value.indexOf("]");
-    if (end < 0 || value[end + 1] !== ":") {
-      return false;
-    }
-    host = value.slice(1, end);
-    portText = value.slice(end + 2);
+function clientIp(request: Request, env: Env): string {
+  const header = env.TRUSTED_PROXY_HEADER ?? "CF-Connecting-IP";
+  const trusted = header ? normalizeClientIp(request.headers.get(header)) : null;
+  return trusted ?? normalizeClientIp(request.headers.get("CF-Connecting-IP")) ?? "unknown";
+}
+
+function normalizeClientIp(value: string | null): string | null {
+  if (!value) return null;
+  let candidate = value.split(",", 1)[0].trim();
+  if (candidate.startsWith("[")) {
+    const end = candidate.indexOf("]");
+    if (end < 0) return null;
+    candidate = candidate.slice(1, end);
   } else {
-    const colon = value.lastIndexOf(":");
-    if (colon <= 0 || value.indexOf(":") !== colon) {
-      return false;
+    const colon = candidate.lastIndexOf(":");
+    if (colon > 0 && candidate.indexOf(":") === colon && /^\d+$/.test(candidate.slice(colon + 1))) {
+      candidate = candidate.slice(0, colon);
     }
-    host = value.slice(0, colon);
-    portText = value.slice(colon + 1);
   }
-
-  if (!/^\d+$/.test(portText)) {
-    return false;
-  }
-  const port = Number(portText);
-  return Number.isInteger(port) && port >= 0 && port <= 65535 && (isIPv4(host) || isIPv6(host));
+  return normalizeIpAddress(candidate);
 }
 
-function isIPv4(value: string): boolean {
-  const parts = value.split(".");
-  return parts.length === 4 && parts.every((part) => {
-    if (!/^\d{1,3}$/.test(part)) {
-      return false;
-    }
-    const octet = Number(part);
-    return octet >= 0 && octet <= 255 && String(octet) === part;
-  });
-}
-
-function isIPv6(value: string): boolean {
-  if (!value.includes(":")) {
-    return false;
-  }
-  try {
-    new URL(`http://[${value}]/`);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function validateHexField(name: string, value: string, length: number): string | null {
-  if (value.length !== length) {
-    return `${name} must be ${length} hex characters`;
-  }
-  if (!/^[0-9a-fA-F]+$/.test(value)) {
-    return `${name} must be valid hex`;
-  }
-  return null;
-}
-
-function bearer(request: Request): string {
-  const header = request.headers.get("Authorization") || "";
-  return header.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
-}
-
-function jsonResponse(status: number, value: unknown): Response {
-  return new Response(JSON.stringify(value), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-function errorResponse(status: number, code: string, message: string): Response {
-  return jsonResponse(status, { error: code, message });
-}
-
-function randomHex(bytes: number): string {
-  const data = new Uint8Array(bytes);
-  crypto.getRandomValues(data);
-  return [...data].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+function debug(env: Env, message: string, error?: unknown): void {
+  if (env.DEBUG === "true") console.log(message, error ?? "");
 }
 
 function encode(value: string): Uint8Array {

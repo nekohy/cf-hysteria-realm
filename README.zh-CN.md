@@ -1,37 +1,113 @@
 # cf-hysteria-realm
 
-用于 Hysteria Realms 的单 realm Cloudflare Workers rendezvous server。
+在 Cloudflare Workers 上实现的 Hy2 Realm 会合服务。完整支持原版 6 个 HTTP/SSE 端点，并按 realm 名称动态注册多个会话。
 
-[English](README.md) | [技术文档](docs/technical.md)
+[English](README.md) · [技术文档](docs/technical.md)
 
-这个项目把 Hysteria Realm 的 rendezvous API 部署到 Cloudflare Workers 上。它只负责协调 rendezvous 和 UDP 打洞所需的元数据。
+## 架构
 
-每个 Worker 部署只对应一个 `REALM_ID`。如果需要多个 realm，请部署多个 Worker。
+- **Cloudflare Workers**：HTTP API、认证、SSE 输出和 10 秒打洞等待。
+- **Cloudflare D1**：持久化 realm 会话、客户端 IP 限额、nonce、打洞响应和离线事件队列。
+- **Ably**：通过 REST + SSE 实时传递 `punch`、`heartbeat_ack` 和打洞响应。
 
-Cloudflare 单个账户 Durable Objects 的免费配额只够支撑一个 Worker 部署。
+不再使用 Durable Objects，也不需要 KV/D1 轮询。Hysteria 流量不经过本服务；这里只交换 UDP 打洞所需的元数据。
+
+## 功能
+
+- 多 realm 动态注册，共享同一个 `REALM_TOKEN`。
+- 60 秒 session TTL、heartbeat 地址更新、10 秒 connect 等待与地址回退。
+- 原版 `realm_taken`、`realm_limit_reached`、`ip_limit_reached` 语义。
+- 每 realm 最多 16 个进行中的 connect，nonce 在不同 realm 间隔离。
+- session、打洞状态和最多 16 条未送达事件持久化，SSE 重连时按事件原子认领补发。
+- 可选的 Prometheus 核心指标接口。
+- 无运行时依赖，Ably 使用原生 HTTP/SSE，无需 SDK。
 
 ## 部署
 
-点击下面的按钮即可通过 Cloudflare 部署：
+### 1. 准备免费账号
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/outlook84/cf-hysteria-realm)
+需要一个 Cloudflare 账号和一个 Ably 账号。Ably API Key 必须具有 **publish + subscribe** 权限；它只会保存在 Worker secret 中，不会返回给 Hysteria server 或 client。
 
-点击后，Cloudflare 会克隆仓库、创建 Worker、要求填写必要的 secret，并部署到 `workers.dev`。
+### 2. 创建 D1 数据库
+
+要求 Node.js 24+。使用 Corepack 运行 pnpm：
+
+```bash
+corepack pnpm install
+corepack pnpm exec wrangler login
+corepack pnpm exec wrangler d1 create cf-hysteria-realm
+```
+
+把命令输出的 `database_id` 填入 `wrangler.jsonc`，然后应用初始 schema：
+
+```bash
+corepack pnpm run db:migrate:remote
+```
+
+### 3. 配置 secret
+
+```bash
+corepack pnpm exec wrangler secret put REALM_TOKEN
+corepack pnpm exec wrangler secret put ABLY_API_KEY
+```
+
+`REALM_TOKEN` 应是足够长的随机字符串。若需要 `/metrics`，再设置独立 secret：
+
+```bash
+corepack pnpm exec wrangler secret put METRICS_TOKEN
+```
+
+### 4. 部署并配置 Hy2
+
+```bash
+corepack pnpm run deploy
+```
+
+在 Hysteria Realm 配置中使用部署后的 Worker URL 和 `REALM_TOKEN`。客户端与 realm server 的详细配置遵循 [Hy2 Realms 官方文档](https://v2.hysteria.network/docs/advanced/Realms/)。
 
 ## 配置
 
-| 名称 | 类型 | 必填 | 说明 |
+| 名称 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `REALM_ID` | Variable | 是 | 这个 Worker 接受的唯一 realm ID。 |
-| `REALM_TOKEN` | Secret | 是 | Hysteria realm server 和 client 共用的 token。 |
-| `DEBUG` | Variable | 否 | 正常使用保持 `false`，排查问题时再改成 `true`。 |
+| `REALM_TOKEN` | Secret | 必填 | realm server 注册和 client connect 共用的 token。 |
+| `ABLY_API_KEY` | Secret | 必填 | 具有 publish/subscribe 权限的完整 Ably API Key。 |
+| `MAX_REALMS` | Variable | `65536` | 全局活跃 realm 上限；`0` 表示不限制。 |
+| `MAX_REALMS_PER_IP` | Variable | `4` | 每个注册客户端 IP 的活跃 realm 上限；`0` 表示不限制。 |
+| `REALM_NAME_PATTERN` | Variable | 原版正则 | 可选的 realm 名称正则。 |
+| `TRUSTED_PROXY_HEADER` | Variable | `CF-Connecting-IP` | 可信客户端 IP 请求头；取逗号列表最左值。 |
+| `METRICS_TOKEN` | Secret | 未设置 | 设置后启用 `GET /metrics`，使用独立 Bearer token。 |
+| `DEBUG` | Variable | `false` | 排查问题时设为 `true`。 |
 
-## 注意
+**安全提示：** 仅在可信代理会覆盖请求头时使用 `TRUSTED_PROXY_HEADER`，否则调用者可伪造 IP 绕过单 IP 限额。Cloudflare 直连部署使用默认的 `CF-Connecting-IP` 即可。
 
-- 一个 Worker 部署只支持一个 realm。
-- 这个 Worker 需要 Durable Objects，相关配置已经写在 `wrangler.jsonc`。
-- 不建议只把 `src/index.ts` 复制到 Cloudflare 在线编辑器，因为还需要手动创建 Durable Object binding 和 migration。
-- API 行为、本地开发和运行时细节见 [技术文档](docs/technical.md)。
+## 免费额度
+
+免费额度均按账号共享，不是每个部署各一份：
+
+- Cloudflare Workers Free：100,000 请求/天。
+- Cloudflare D1 Free：每天 5M rows read、100K rows written，5 GB 存储。
+- Ably Free：500 并发连接、500 峰值频道、6M 消息/月。
+
+本实现不在长连接中查询 D1，但 heartbeat 和业务事件仍会消耗 D1 写入及 Ably 消息。实际可承载的 realm 数取决于心跳、打洞频率和账号内其他项目，不能视为无限额度。
+
+## 本地开发与测试
+
+```bash
+cp .dev.vars.example .dev.vars
+# 填入真实 REALM_TOKEN 和 ABLY_API_KEY
+corepack pnpm run db:migrate:local
+corepack pnpm run dev
+```
+
+运行检查：
+
+```bash
+corepack pnpm run typecheck
+corepack pnpm run test
+corepack pnpm exec wrangler deploy --dry-run
+```
+
+测试使用内存 SQLite 和模拟 Ably，不会访问真实服务。
 
 ## License
 

@@ -1,27 +1,25 @@
-# Technical Docs
+# Technical documentation
 
-Technical details for `cf-hysteria-realm`.
+## Compatibility and architecture
 
-## Architecture
+The service implements the rendezvous protocol used by [HyNetworks/hysteria-realm-server](https://github.com/HyNetworks/hysteria-realm-server) and the Hysteria 2 Realm client. It coordinates metadata only; it never relays Hysteria UDP traffic.
 
-This is a Cloudflare Workers + Durable Object implementation of the Hysteria Realm rendezvous API. It intentionally supports one configured realm per deployment. Deploy another Worker instance when you need another realm.
+Cloudflare Workers handle all external requests. D1 stores sessions and connect attempts, while Ably supplies realtime notifications. No Durable Object, KV entry, or database polling loop is held open by an SSE connection.
 
-The Worker only coordinates rendezvous and UDP hole punching metadata. It does not proxy or relay Hysteria traffic.
+### Request flow
 
-The Durable Object is configured with a SQLite-backed class via `new_sqlite_classes`.
+1. A realm server registers its addresses and receives a random `session_id`.
+2. The realm server opens `/events`; the Worker subscribes to that session's private Ably channel and forwards messages as Hy2-compatible SSE.
+3. A client calls `/connect`. D1 atomically records the nonce and a persistent `punch` event, then the Worker publishes an event notification to the realm server's channel.
+4. The realm server performs its hole-punching work and calls `/connects/{nonce}`.
+5. D1 stores the fresh addresses and Ably wakes the waiting client request. The returned addresses are read from D1, not trusted from the notification payload.
+6. If no response arrives within 10 seconds, the client receives the latest registered/heartbeat addresses.
+
+Session and attempt expiry is enforced on every relevant D1 query. A scheduled Worker runs every five minutes to delete expired rows; correctness does not depend on that cleanup running exactly at the expiry instant.
 
 ## API
 
-The Worker keeps the same path shape as `hysteria-realm-server`. `{id}` must match the configured `REALM_ID`.
-
-- `POST /v1/{id}`
-- `GET /v1/{id}/events`
-- `POST /v1/{id}/heartbeat`
-- `DELETE /v1/{id}`
-- `POST /v1/{id}/connect`
-- `POST /v1/{id}/connects/{nonce}`
-
-Responses with bodies are JSON. Errors use this shape:
+All error responses have this shape:
 
 ```json
 {
@@ -30,135 +28,160 @@ Responses with bodies are JSON. Errors use this shape:
 }
 ```
 
-## Authentication
+`{id}` must match `REALM_NAME_PATTERN`. Its default is:
 
-There are two bearer tokens:
+```text
+^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$
+```
 
-| Token | Used by |
+### Authentication
+
+| Token | Endpoints |
 | --- | --- |
-| `REALM_TOKEN` | `POST /v1/{id}` and `POST /v1/{id}/connect` |
-| `session_id` returned by registration | `GET /events`, `POST /heartbeat`, `DELETE /v1/{id}`, and `POST /connects/{nonce}` |
+| `REALM_TOKEN` | `POST /v1/{id}`, `POST /v1/{id}/connect` |
+| `session_id` | `GET /events`, `POST /heartbeat`, `DELETE /v1/{id}`, `POST /connects/{nonce}` |
+| `METRICS_TOKEN` | `GET /metrics` when configured |
 
-Send tokens with:
+Use this header:
 
 ```http
 Authorization: Bearer <token>
 ```
 
-## Requests
-
-Register the server:
+### Register
 
 ```http
 POST /v1/{id}
 Authorization: Bearer <REALM_TOKEN>
 Content-Type: application/json
-```
 
-```json
-{
-  "addresses": ["203.0.113.10:4433"]
-}
+{"addresses":["203.0.113.10:4433"]}
 ```
 
 Success:
 
 ```json
+{"session_id":"generated-session-token","ttl":60}
+```
+
+An active realm name returns `409 realm_taken`. Registration can also return `429 realm_limit_reached` or `429 ip_limit_reached`. An expired name can be registered again.
+
+### Events
+
+```http
+GET /v1/{id}/events
+Authorization: Bearer <session_id>
+```
+
+The response is `text/event-stream`. Business events match the original implementation:
+
+```text
+event: punch
+data: {"addresses":["198.51.100.20:4433"],"nonce":"00112233445566778899aabbccddeeff","obfs":"..."}
+
+event: heartbeat_ack
+data: {"ttl":60}
+```
+
+The Worker can also emit `: connected` and `: keepalive` comments. SSE comments are ignored by the Hy2 client. A deregistered or expired session closes the stream.
+
+Every business event is stored in a D1 outbox before its Ably notification is published. The Worker subscribes first, revalidates the session, and acquires a D1 stream lease before claiming undelivered rows. The newest lease supersedes older streams. `DELETE ... RETURNING` atomically claims each event before writing it, so overlapping streams cannot consume the same row. Delivery does not depend on `Last-Event-ID`, which the original Hy2 client does not send. As with the original in-memory queue, a crash after claiming but before writing can lose the in-flight event. The outbox is capped at 16 events per session, and streams rotate before reaching the Free plan's per-invocation D1 query limit.
+
+### Heartbeat
+
+```http
+POST /v1/{id}/heartbeat
+Authorization: Bearer <session_id>
+Content-Type: application/json
+
+{"addresses":["203.0.113.11:4433"]}
+```
+
+The body can be empty or `{}` to renew without changing addresses. Success returns `{"ttl":60}` and publishes `heartbeat_ack`.
+
+### Deregister
+
+```http
+DELETE /v1/{id}
+Authorization: Bearer <session_id>
+```
+
+Success returns `204`. The session and its pending attempts are removed; the event stream and waiting connect requests are notified through Ably.
+
+### Client connect
+
+```http
+POST /v1/{id}/connect
+Authorization: Bearer <REALM_TOKEN>
+Content-Type: application/json
+
 {
-  "session_id": "generated-session-token",
-  "ttl": 60
+  "addresses":["198.51.100.20:4433"],
+  "nonce":"00112233445566778899aabbccddeeff",
+  "obfs":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
 }
 ```
 
-Heartbeat refreshes the current session. It may also replace cached server addresses:
+A realm can have at most 16 active attempts. A duplicate active nonce or a full pending set returns `503 rate_limited`. Success returns fresh server addresses or the fallback addresses:
 
 ```json
 {
-  "addresses": ["203.0.113.11:4433"]
+  "addresses":["198.51.100.1:9999"],
+  "nonce":"00112233445566778899aabbccddeeff",
+  "obfs":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
 }
 ```
 
-Client connect requests require a nonce and obfs value:
-
-```json
-{
-  "addresses": ["198.51.100.20:4433"],
-  "nonce": "00112233445566778899aabbccddeeff",
-  "obfs": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
-}
-```
-
-The Worker sends a `punch` event to the server event stream. The server can answer with:
+### Realm-server connect response
 
 ```http
 POST /v1/{id}/connects/{nonce}
 Authorization: Bearer <session_id>
 Content-Type: application/json
+
+{"addresses":["198.51.100.1:9999"]}
 ```
 
-```json
-{
-  "addresses": ["198.51.100.1:9999"]
-}
+Success returns `204`. An expired or unknown nonce returns `404 attempt_not_found`. If the Ably wakeup is delayed or lost, the 10-second cleanup path still reads any recorded D1 response.
+
+### Metrics
+
+When `METRICS_TOKEN` is configured:
+
+```http
+GET /metrics
+Authorization: Bearer <METRICS_TOKEN>
 ```
 
-If no connect response arrives within 10 seconds, the connect request falls back to the last cached server addresses.
+The Prometheus text response exposes `realms_registered`, `sessions_active`, `event_streams_active`, `pending_connects`, `global_limit`, and `ip_limit` gauges under the `hysteria_realm_` namespace. Without `METRICS_TOKEN`, the route is not exposed.
 
-## Configuration
+## Validation and limits
 
-Set these values in Cloudflare Worker settings or with Wrangler:
+- Request bodies: 4 KiB.
+- Addresses: 1–8 IP/port strings; hostnames are not accepted.
+- `nonce`: 32 hexadecimal characters.
+- `obfs`: 64 hexadecimal characters.
+- Active connect attempts: 16 per realm.
+- `MAX_REALMS` and `MAX_REALMS_PER_IP`: `0` disables the corresponding limit.
 
-| Name | Required | Description |
-| --- | --- | --- |
-| `REALM_ID` | Yes | The only realm ID this deployment accepts. |
-| `REALM_TOKEN` | Yes | Shared bearer token used for registration and client connect requests. Store it as a Cloudflare dashboard secret or with `wrangler secret put REALM_TOKEN`. |
-| `DEBUG` | No | Set to `true` for debug logs. Defaults to `false`. |
+The per-IP quota uses the left-most value in `TRUSTED_PROXY_HEADER`, strips an optional port, and normalizes IPv4-mapped IPv6 addresses. Invalid header values fall back to `CF-Connecting-IP`; if neither is valid, registrations share the `unknown` bucket.
 
-Address values must be IP address and port strings. IPv4 uses `host:port`; IPv6 uses `[host]:port`. Domain names are not accepted.
+## Local development
 
-## Local Development
+Create D1 and set `database_id` in `wrangler.jsonc` first. Then:
 
 ```bash
-pnpm install
-pnpm run dev
+cp .dev.vars.example .dev.vars
+corepack pnpm run db:migrate:local
+corepack pnpm run dev
 ```
 
-For local development, create `.dev.vars`:
+Local event delivery requires a real Ably key. Unit and integration tests use `node:sqlite` and mocked Ably responses instead.
 
-```text
-REALM_TOKEN=your-secret-token
-REALM_ID=example
-DEBUG=true
-```
-
-## Manual Deploy
+## Checks
 
 ```bash
-pnpm run deploy
+corepack pnpm run typecheck
+corepack pnpm run test
+corepack pnpm exec wrangler deploy --dry-run
 ```
-
-`wrangler.jsonc` declares `REALM_TOKEN` as a required secret:
-
-```json
-{
-  "secrets": {
-    "required": ["REALM_TOKEN"]
-  }
-}
-```
-
-## Test
-
-```bash
-pnpm run typecheck
-pnpm run test
-```
-
-## Runtime Notes
-
-- Only one server session can be active. A new successful registration replaces the previous session and cancels in-flight connect attempts.
-- Session TTL is 60 seconds.
-- `/connect` waits up to 10 seconds for `/connects/{nonce}` before returning cached server addresses.
-- The event stream sends `punch` events and periodic keepalive comments.
-- Sessions and SSE streams are runtime state. If the Durable Object restarts, clients should register and reconnect again.
-- One deployment supports one realm. Use multiple deployments or routes for multiple realms.

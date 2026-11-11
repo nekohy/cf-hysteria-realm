@@ -4,9 +4,4 @@ export default defineConfig({
   test: {
     environment: "node",
   },
-  resolve: {
-    alias: {
-      "cloudflare:workers": "./test/cloudflare-workers-shim.ts",
-    },
-  },
 });

@@ -1,25 +1,45 @@
 {
   "name": "cf-hysteria-realm",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "license": "MIT",
   "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "db:migrate:local": "wrangler d1 migrations apply cf-hysteria-realm --local",
+    "db:migrate:remote": "wrangler d1 migrations apply cf-hysteria-realm --remote",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
   "cloudflare": {
     "bindings": {
-      "REALM_ID": {
-        "description": "The single Hysteria realm ID accepted by this deployment. Use the same value in your Hysteria Realm configuration."
-      },
       "REALM_TOKEN": {
-        "description": "Shared bearer token for registering the server and accepting client connect requests. Generate a long random value and keep it secret."
+        "description": "Shared bearer token used by Hysteria realm servers and clients. Generate a long random value."
+      },
+      "ABLY_API_KEY": {
+        "description": "Full Ably API key with publish and subscribe permissions. Keep it in Worker secrets."
+      },
+      "METRICS_TOKEN": {
+        "description": "Optional separate Bearer token that enables GET /metrics."
+      },
+      "REALM_NAME_PATTERN": {
+        "description": "Optional JavaScript realm-name regular expression; defaults to the Hy2 Realm pattern."
+      },
+      "MAX_REALMS": {
+        "description": "Maximum active realms. Set to 0 for unlimited; defaults to 65536."
+      },
+      "MAX_REALMS_PER_IP": {
+        "description": "Maximum active realms registered by one client IP. Set to 0 for unlimited; defaults to 4."
+      },
+      "TRUSTED_PROXY_HEADER": {
+        "description": "Trusted client IP header. Defaults to CF-Connecting-IP; only use a header overwritten by your proxy."
       },
       "DEBUG": {
-        "description": "Set to `true` to enable Worker console debug logs. Use `false` for normal deployments."
+        "description": "Set to true only while troubleshooting."
       }
     }
   },

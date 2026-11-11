@@ -3,30 +3,30 @@
   "name": "cf-hysteria-realm",
   "main": "src/index.ts",
   "compatibility_date": "2026-05-30",
+  "compatibility_flags": ["enable_request_signal"],
   "workers_dev": true,
   "preview_urls": true,
   "keep_vars": true,
   "vars": {
-    "REALM_ID": "",
+    "MAX_REALMS": "65536",
+    "MAX_REALMS_PER_IP": "4",
+    "TRUSTED_PROXY_HEADER": "CF-Connecting-IP",
     "DEBUG": "false"
   },
   "secrets": {
-    "required": ["REALM_TOKEN"]
+    "required": ["REALM_TOKEN", "ABLY_API_KEY"]
   },
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "REALM",
-        "class_name": "SingleRealm"
-      }
-    ]
-  },
-  "migrations": [
+  "d1_databases": [
     {
-      "tag": "v1",
-      "new_sqlite_classes": ["SingleRealm"]
+      "binding": "DB",
+      "database_name": "cf-hysteria-realm",
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
     }
   ],
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
   "observability": {
     "enabled": true
   }
