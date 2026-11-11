@@ -168,7 +168,7 @@ The per-IP quota uses the left-most value in `TRUSTED_PROXY_HEADER`, strips an o
 
 ## Local development
 
-Create D1 and set `database_id` in `wrangler.jsonc` first. Then:
+Create D1 once with `corepack pnpm exec wrangler d1 create cf-hysteria-realm`. No `database_id` is required; commands resolve the `DB` binding. Then:
 
 ```bash
 cp .dev.vars.example .dev.vars

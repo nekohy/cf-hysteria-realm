@@ -3,15 +3,16 @@
   "version": "1.0.0",
   "private": true,
   "license": "MIT",
+  "author": "Nekohy (https://github.com/nekohy)",
   "type": "module",
   "engines": {
     "node": ">=24"
   },
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "db:migrate:local": "wrangler d1 migrations apply cf-hysteria-realm --local",
-    "db:migrate:remote": "wrangler d1 migrations apply cf-hysteria-realm --remote",
+    "deploy": "npm run db:migrate:remote && wrangler deploy",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local",
+    "db:migrate:remote": "wrangler d1 migrations apply DB --remote",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
@@ -44,9 +45,9 @@
     }
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260530.0",
+    "@cloudflare/workers-types": "^5.20261104.1",
     "typescript": "^5.9.3",
     "vitest": "^4.1.7",
-    "wrangler": "^4.18.0"
+    "wrangler": "^4.102.0"
   }
 }

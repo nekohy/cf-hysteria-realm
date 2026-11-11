@@ -20,7 +20,6 @@
     {
       "binding": "DB",
       "database_name": "cf-hysteria-realm",
-      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
       "migrations_dir": "migrations"
     }
   ],

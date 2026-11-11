@@ -2,6 +2,8 @@
 
 在 Cloudflare Workers 上实现的 Hy2 Realm 会合服务。完整支持原版 6 个 HTTP/SSE 端点，并按 realm 名称动态注册多个会话。
 
+维护者：[Nekohy](https://github.com/nekohy)。
+
 [English](README.md) · [技术文档](docs/technical.md)
 
 ## 架构
@@ -24,46 +26,39 @@
 
 ## 部署
 
-### 1. 准备免费账号
+### 一键部署（推荐）
 
-需要一个 Cloudflare 账号和一个 Ably 账号。Ably API Key 必须具有 **publish + subscribe** 权限；它只会保存在 Worker secret 中，不会返回给 Hysteria server 或 client。
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/nekohy/cf-hysteria-realm)
 
-### 2. 创建 D1 数据库
+1. 准备 Cloudflare 和 Ably 免费账号。Ably API Key 需要 **publish + subscribe** 权限，它只会保存在 Worker secret 中。
+2. 点击上方按钮并授权 GitHub、Cloudflare。确认部署来源是 **nekohy/cf-hysteria-realm**。
+3. 在部署页面填写 `REALM_TOKEN` 和 `ABLY_API_KEY`，确认 Worker 与 D1 名称后开始部署。Cloudflare 会自动创建 D1，部署脚本会应用 `migrations/` 中的初始 schema。
+4. 部署完成后，在 Hy2 Realm 配置中使用 Worker URL 和 `REALM_TOKEN`。
 
-要求 Node.js 24+。使用 Corepack 运行 pnpm：
+如需 `/metrics`，部署后再设置独立的 `METRICS_TOKEN` secret。
+
+### 手动部署
+
+要求 Node.js 24+：
 
 ```bash
+git clone https://github.com/nekohy/cf-hysteria-realm.git
+cd cf-hysteria-realm
 corepack pnpm install
 corepack pnpm exec wrangler login
 corepack pnpm exec wrangler d1 create cf-hysteria-realm
-```
-
-把命令输出的 `database_id` 填入 `wrangler.jsonc`，然后应用初始 schema：
-
-```bash
-corepack pnpm run db:migrate:remote
-```
-
-### 3. 配置 secret
-
-```bash
 corepack pnpm exec wrangler secret put REALM_TOKEN
 corepack pnpm exec wrangler secret put ABLY_API_KEY
+corepack pnpm run deploy
 ```
 
-`REALM_TOKEN` 应是足够长的随机字符串。若需要 `/metrics`，再设置独立 secret：
+无需手动填写 `database_id`；migration 和部署命令都使用绑定名 `DB`。`REALM_TOKEN` 应是足够长的随机字符串。若需要 `/metrics`，再执行：
 
 ```bash
 corepack pnpm exec wrangler secret put METRICS_TOKEN
 ```
 
-### 4. 部署并配置 Hy2
-
-```bash
-corepack pnpm run deploy
-```
-
-在 Hysteria Realm 配置中使用部署后的 Worker URL 和 `REALM_TOKEN`。客户端与 realm server 的详细配置遵循 [Hy2 Realms 官方文档](https://v2.hysteria.network/docs/advanced/Realms/)。
+客户端与 realm server 的详细配置遵循 [Hy2 Realms 官方文档](https://v2.hysteria.network/docs/advanced/Realms/)。
 
 ## 配置
 

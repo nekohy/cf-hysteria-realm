@@ -2,6 +2,8 @@
 
 A Hy2 Realm rendezvous service running on Cloudflare Workers. It implements the original six HTTP/SSE endpoints and supports dynamically registered realms.
 
+Maintained by [Nekohy](https://github.com/nekohy).
+
 [中文说明](README.zh-CN.md) · [Technical docs](docs/technical.md)
 
 ## Architecture
@@ -24,46 +26,39 @@ There are no Durable Objects and no KV/D1 polling. This service only exchanges U
 
 ## Deploy
 
-### 1. Prepare free accounts
+### One-click deploy (recommended)
 
-You need Cloudflare and Ably accounts. Create an Ably API key with **publish + subscribe** permission. The key is stored as a Worker secret and is never returned to Hysteria servers or clients.
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/nekohy/cf-hysteria-realm)
 
-### 2. Create D1
+1. Prepare free Cloudflare and Ably accounts. The Ably API key needs **publish + subscribe** permission and is stored only as a Worker secret.
+2. Click the button and authorize GitHub and Cloudflare. Confirm that the deployment source is **nekohy/cf-hysteria-realm**.
+3. Enter `REALM_TOKEN` and `ABLY_API_KEY`, confirm the Worker and D1 names, and deploy. Cloudflare creates D1 automatically, and the deploy script applies the initial schema from `migrations/`.
+4. Use the deployed Worker URL and `REALM_TOKEN` in your Hy2 Realm configuration.
 
-Node.js 24+ is required. Use Corepack to run pnpm:
+To enable `/metrics`, set a separate `METRICS_TOKEN` secret after deployment.
+
+### Manual deploy
+
+Node.js 24+ is required:
 
 ```bash
+git clone https://github.com/nekohy/cf-hysteria-realm.git
+cd cf-hysteria-realm
 corepack pnpm install
 corepack pnpm exec wrangler login
 corepack pnpm exec wrangler d1 create cf-hysteria-realm
-```
-
-Copy the resulting `database_id` into `wrangler.jsonc`, then apply the initial schema:
-
-```bash
-corepack pnpm run db:migrate:remote
-```
-
-### 3. Configure secrets
-
-```bash
 corepack pnpm exec wrangler secret put REALM_TOKEN
 corepack pnpm exec wrangler secret put ABLY_API_KEY
+corepack pnpm run deploy
 ```
 
-Use a long random `REALM_TOKEN`. To enable `GET /metrics`, also set a separate secret:
+There is no need to fill in `database_id`; migrations and deployment use the `DB` binding. Use a long random `REALM_TOKEN`. To enable `/metrics`, also run:
 
 ```bash
 corepack pnpm exec wrangler secret put METRICS_TOKEN
 ```
 
-### 4. Deploy and configure Hy2
-
-```bash
-corepack pnpm run deploy
-```
-
-Use the deployed Worker URL and `REALM_TOKEN` in your Hysteria Realm configuration. See the [official Hy2 Realms documentation](https://v2.hysteria.network/docs/advanced/Realms/) for server and client settings.
+See the [official Hy2 Realms documentation](https://v2.hysteria.network/docs/advanced/Realms/) for server and client settings.
 
 ## Configuration
 
