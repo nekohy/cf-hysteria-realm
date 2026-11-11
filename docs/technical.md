@@ -28,7 +28,7 @@ All error responses have this shape:
 }
 ```
 
-`{id}` must match `REALM_NAME_PATTERN`. Its default is:
+`{id}` uses the original Hy2 Realm name pattern:
 
 ```text
 ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$
@@ -64,7 +64,7 @@ Success:
 {"session_id":"generated-session-token","ttl":60}
 ```
 
-An active realm name returns `409 realm_taken`. Registration can also return `429 realm_limit_reached` or `429 ip_limit_reached`. An expired name can be registered again.
+An active realm name returns `409 realm_taken`. An expired name can be registered again. There are no artificial global or per-IP realm-count limits.
 
 ### Events
 
@@ -153,7 +153,7 @@ GET /metrics
 Authorization: Bearer <METRICS_TOKEN>
 ```
 
-The Prometheus text response exposes `realms_registered`, `sessions_active`, `event_streams_active`, `pending_connects`, `global_limit`, and `ip_limit` gauges under the `hysteria_realm_` namespace. Without `METRICS_TOKEN`, the route is not exposed.
+The Prometheus text response exposes `realms_registered`, `sessions_active`, `event_streams_active`, and `pending_connects` gauges under the `hysteria_realm_` namespace. Without `METRICS_TOKEN`, the route is not exposed.
 
 ## Validation and limits
 
@@ -162,9 +162,9 @@ The Prometheus text response exposes `realms_registered`, `sessions_active`, `ev
 - `nonce`: 32 hexadecimal characters.
 - `obfs`: 64 hexadecimal characters.
 - Active connect attempts: 16 per realm.
-- `MAX_REALMS` and `MAX_REALMS_PER_IP`: `0` disables the corresponding limit.
+- Undelivered events: 16 per session.
 
-The per-IP quota uses the left-most value in `TRUSTED_PROXY_HEADER`, strips an optional port, and normalizes IPv4-mapped IPv6 addresses. Invalid header values fall back to `CF-Connecting-IP`; if neither is valid, registrations share the `unknown` bucket.
+Realm sessions have no artificial global or per-IP count limit. Cloudflare and Ably account quotas still apply.
 
 ## Local development
 

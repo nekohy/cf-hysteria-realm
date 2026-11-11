@@ -1,16 +1,12 @@
 CREATE TABLE realm_sessions (
   realm_id TEXT PRIMARY KEY,
   id TEXT NOT NULL,
-  owner_ip TEXT NOT NULL,
   addresses TEXT NOT NULL,
   expires_at INTEGER NOT NULL
 );
 
 CREATE INDEX realm_sessions_expires_at_idx
   ON realm_sessions (expires_at);
-
-CREATE INDEX realm_sessions_owner_ip_expires_at_idx
-  ON realm_sessions (owner_ip, expires_at);
 
 CREATE TABLE connect_attempts (
   realm_id TEXT NOT NULL,

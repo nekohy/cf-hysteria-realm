@@ -45,8 +45,6 @@ function env(): Env {
     DB: {} as D1Database,
     REALM_TOKEN,
     ABLY_API_KEY: "key-id:secret",
-    MAX_REALMS: "65536",
-    MAX_REALMS_PER_IP: "4",
     DEBUG: "false",
   };
 }
@@ -103,7 +101,7 @@ afterEach(() => {
 });
 
 describe("Worker API", () => {
-  it("registers arbitrary valid realms with original quota inputs", async () => {
+  it("registers arbitrary valid realms", async () => {
     const register = vi.spyOn(RealmStore.prototype, "register").mockResolvedValue({
       status: "ok",
       session: session("any-name"),
@@ -116,63 +114,18 @@ describe("Worker API", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ session_id: SESSION_ID, ttl: 60 });
-    expect(register).toHaveBeenCalledWith("any-name", ADDRESSES, "203.0.113.50", 65_536, 4);
+    expect(register).toHaveBeenCalledWith("any-name", ADDRESSES);
   });
 
-  it("maps registration conflicts and both quota errors", async () => {
-    const register = vi.spyOn(RealmStore.prototype, "register");
-    const { ctx } = executionContext();
-    const cases = [
-      ["realm_taken", 409],
-      ["realm_limit_reached", 429],
-      ["ip_limit_reached", 429],
-    ] as const;
+  it("maps registration conflicts", async () => {
+    vi.spyOn(RealmStore.prototype, "register").mockResolvedValue({ status: "realm_taken" });
 
-    for (const [status, httpStatus] of cases) {
-      register.mockResolvedValueOnce({ status });
-      const response = await worker.fetch(request("POST", "/v1/realm-a", REALM_TOKEN, {
-        addresses: ADDRESSES,
-      }), env(), ctx);
-      expect(response.status).toBe(httpStatus);
-      expect(await response.json()).toMatchObject({ error: status });
-    }
-  });
+    const response = await worker.fetch(request("POST", "/v1/realm-a", REALM_TOKEN, {
+      addresses: ADDRESSES,
+    }), env(), executionContext().ctx);
 
-  it("uses the left-most trusted proxy IP and strips its port", async () => {
-    const register = vi.spyOn(RealmStore.prototype, "register").mockResolvedValue({
-      status: "ok",
-      session: session(),
-    });
-    const environment = env();
-    environment.TRUSTED_PROXY_HEADER = "X-Forwarded-For";
-    const req = request("POST", "/v1/realm-a", REALM_TOKEN, { addresses: ADDRESSES });
-    req.headers.set("X-Forwarded-For", "198.51.100.20:1234, 203.0.113.50");
-
-    const response = await worker.fetch(req, environment, executionContext().ctx);
-
-    expect(response.status).toBe(200);
-    expect(register).toHaveBeenCalledWith("realm-a", ADDRESSES, "198.51.100.20", 65_536, 4);
-  });
-
-  it("supports custom realm names throughout the Ably channel path", async () => {
-    const current = session("realm.example");
-    vi.spyOn(RealmStore.prototype, "heartbeat").mockResolvedValue({
-      session: current,
-      event: storedEvent("heartbeat_ack", { ttl: 60 }, "realm.example"),
-    });
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 201 }));
-    vi.stubGlobal("fetch", fetchMock);
-    const environment = env();
-    environment.REALM_NAME_PATTERN = "^[a-z.]+$";
-
-    const response = await worker.fetch(
-      request("POST", "/v1/realm.example/heartbeat", SESSION_ID, {}),
-      environment,
-      executionContext().ctx,
-    );
-
-    expect(response.status).toBe(200);
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: "realm_taken" });
   });
 
   it("renews heartbeats and publishes heartbeat_ack", async () => {

@@ -2,7 +2,7 @@ const MAX_REQUEST_BODY_BYTES = 4 << 10;
 const MAX_ADDRESSES = 8;
 const NONCE_HEX_LENGTH = 32;
 const OBFS_HEX_LENGTH = 64;
-export const DEFAULT_REALM_NAME_PATTERN = "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$";
+const REALM_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 
 export type Route =
   | { kind: "register" | "deregister" | "events" | "heartbeat" | "connect"; realmId: string }
@@ -13,11 +13,8 @@ export type RouteResult =
   | { kind: "badRequest"; message: string }
   | { kind: "methodNotAllowed"; realmId: string };
 
-export function isValidRealmId(
-  realmId: string,
-  namePattern = DEFAULT_REALM_NAME_PATTERN,
-): boolean {
-  return new RegExp(namePattern).test(realmId);
+export function isValidRealmId(realmId: string): boolean {
+  return REALM_ID_PATTERN.test(realmId);
 }
 
 export function parseRoute(pathname: string, method: string): RouteResult | null {
@@ -142,16 +139,6 @@ function isIPv6(value: string): boolean {
   } catch {
     return false;
   }
-}
-
-export function normalizeIpAddress(value: string): string | null {
-  const mapped = value.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i)?.[1];
-  const normalized = mapped ?? value;
-  if (isIPv4(normalized)) return normalized;
-  if (isIPv6(normalized)) {
-    return new URL(`http://[${normalized}]/`).hostname.slice(1, -1).toLowerCase();
-  }
-  return null;
 }
 
 export function bearer(request: Request): string {

@@ -38,8 +38,6 @@ const MIGRATION_SQL = readFileSync("migrations/0001_init.sql", "utf8");
 const INITIAL_ADDRESSES = ["203.0.113.10:4433"];
 const UPDATED_ADDRESSES = ["203.0.113.11:4433"];
 const FRESH_ADDRESSES = ["198.51.100.20:9999"];
-const OWNER_IP = "192.0.2.10";
-const OTHER_OWNER_IP = "192.0.2.11";
 const PUNCH = {
   addresses: ["198.51.100.30:4433"],
   obfs: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
@@ -160,11 +158,8 @@ async function registerOk(
   store: RealmStore,
   realmId: string,
   addresses = INITIAL_ADDRESSES,
-  ownerIp = OWNER_IP,
-  maxRealms = 65_536,
-  maxRealmsPerIp = 4,
 ) {
-  const result = await store.register(realmId, addresses, ownerIp, maxRealms, maxRealmsPerIp);
+  const result = await store.register(realmId, addresses);
   if (result.status !== "ok") throw new Error(`unexpected registration result: ${result.status}`);
   return result.session;
 }
@@ -230,7 +225,7 @@ describe("RealmStore", () => {
     const session = await registerOk(store, "realm-a");
     const started = await beginOk(store, "realm-a", "pending-nonce");
 
-    expect(await store.register("realm-a", UPDATED_ADDRESSES, OTHER_OWNER_IP, 100, 4)).toEqual({
+    expect(await store.register("realm-a", UPDATED_ADDRESSES)).toEqual({
       status: "realm_taken",
     });
     expect(await store.session("realm-a", session.id)).toEqual(session);
@@ -247,7 +242,7 @@ describe("RealmStore", () => {
     expect(await store.openEventStream("realm-a", first.id, "old-stream")).toEqual(first);
     vi.advanceTimersByTime(SESSION_TTL_MS + 1);
 
-    const result = await store.register("realm-a", UPDATED_ADDRESSES, OWNER_IP, 1, 1);
+    const result = await store.register("realm-a", UPDATED_ADDRESSES);
     if (result.status !== "ok") throw new Error(`unexpected registration result: ${result.status}`);
 
     expect(result.session.id).not.toBe(first.id);
@@ -480,7 +475,7 @@ describe("RealmStore", () => {
 
   it("reads events in sequence order with realm and session isolation", async () => {
     const first = await registerOk(store, "realm-a");
-    const second = await registerOk(store, "realm-b", UPDATED_ADDRESSES, OTHER_OWNER_IP);
+    const second = await registerOk(store, "realm-b", UPDATED_ADDRESSES);
     const firstHeartbeat = await store.heartbeat("realm-a", first.id);
     const firstPunch = await beginOk(store, "realm-a", "nonce-a");
     const secondHeartbeat = await store.heartbeat("realm-b", second.id);
@@ -671,46 +666,6 @@ describe("RealmStore", () => {
     ).toBe(0);
   });
 
-  it("treats zero registration limits as unlimited", async () => {
-    await expect(store.register("realm-a", INITIAL_ADDRESSES, OWNER_IP, 0, 0)).resolves.toMatchObject({
-      status: "ok",
-    });
-    await expect(store.register("realm-b", UPDATED_ADDRESSES, OWNER_IP, 0, 0)).resolves.toMatchObject({
-      status: "ok",
-    });
-  });
-
-  it("enforces global registration limits and the required error priority", async () => {
-    const session = await registerOk(store, "realm-a");
-
-    expect(await store.register("realm-a", UPDATED_ADDRESSES, OWNER_IP, 0, 0)).toEqual({
-      status: "realm_taken",
-    });
-    expect(await store.register("realm-b", UPDATED_ADDRESSES, OWNER_IP, 1, 1)).toEqual({
-      status: "realm_limit_reached",
-    });
-    expect(
-      await store.register("realm-b", UPDATED_ADDRESSES, OTHER_OWNER_IP, 2, 4),
-    ).toMatchObject({ status: "ok" });
-    expect(
-      await store.register("realm-c", FRESH_ADDRESSES, "192.0.2.12", 2, 4),
-    ).toEqual({ status: "realm_limit_reached" });
-    expect(await store.session("realm-a", session.id)).toEqual(session);
-  });
-
-  it("enforces per-IP registration limits concurrently and isolates other IPs", async () => {
-    const results = await Promise.all([
-      store.register("realm-a", INITIAL_ADDRESSES, OWNER_IP, 100, 1),
-      store.register("realm-b", UPDATED_ADDRESSES, OWNER_IP, 100, 1),
-    ]);
-
-    expect(results.filter((result) => result.status === "ok")).toHaveLength(1);
-    expect(results.filter((result) => result.status === "ip_limit_reached")).toHaveLength(1);
-    expect(
-      await store.register("realm-c", FRESH_ADDRESSES, OTHER_OWNER_IP, 100, 1),
-    ).toMatchObject({ status: "ok" });
-  });
-
   it("still returns fallback at the exact attempt deadline", async () => {
     const session = await registerOk(store, "realm-a");
     const started = await beginOk(store, "realm-a", "deadline-nonce");
@@ -723,7 +678,7 @@ describe("RealmStore", () => {
 
   it("reports only unexpired realm and attempt metrics", async () => {
     const first = await registerOk(store, "realm-a");
-    const second = await registerOk(store, "realm-b", UPDATED_ADDRESSES, OTHER_OWNER_IP);
+    const second = await registerOk(store, "realm-b", UPDATED_ADDRESSES);
     const firstAttempt = await beginOk(store, "realm-a", "nonce-a");
     await beginOk(store, "realm-a", "nonce-b");
     await beginOk(store, "realm-b", "nonce-c");

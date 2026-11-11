@@ -8,9 +8,6 @@
   "preview_urls": true,
   "keep_vars": true,
   "vars": {
-    "MAX_REALMS": "65536",
-    "MAX_REALMS_PER_IP": "4",
-    "TRUSTED_PROXY_HEADER": "CF-Connecting-IP",
     "DEBUG": "false"
   },
   "secrets": {

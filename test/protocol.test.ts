@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   errorResponse,
   isValidRealmId,
-  normalizeIpAddress,
   parseRoute,
   readJson,
   validateAddresses,
@@ -18,10 +17,6 @@ describe("protocol", () => {
     expect(isValidRealmId("realm-a_1")).toBe(true);
     expect(isValidRealmId("-bad")).toBe(false);
     expect(isValidRealmId("bad realm")).toBe(false);
-    expect(isValidRealmId("realm.example", "^[a-z.]+$")).toBe(true);
-    expect(normalizeIpAddress("::ffff:203.0.113.10")).toBe("203.0.113.10");
-    expect(normalizeIpAddress("2001:0db8:0000:0000:0000:0000:0000:0001")).toBe("2001:db8::1");
-    expect(normalizeIpAddress("not-an-ip")).toBeNull();
   });
 
   it("keeps the existing route contract", () => {

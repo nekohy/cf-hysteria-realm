@@ -11,7 +11,6 @@ import {
   errorResponse,
   isValidRealmId,
   jsonResponse,
-  normalizeIpAddress,
   parseRoute,
   readJson,
   validateAddresses,
@@ -34,10 +33,6 @@ export interface Env {
   DB: D1Database;
   REALM_TOKEN: string;
   ABLY_API_KEY: string;
-  REALM_NAME_PATTERN?: string;
-  MAX_REALMS?: string;
-  MAX_REALMS_PER_IP?: string;
-  TRUSTED_PROXY_HEADER?: string;
   METRICS_TOKEN?: string;
   DEBUG?: string;
 }
@@ -63,13 +58,9 @@ export default {
     const route = parseRoute(url.pathname, request.method);
     if (!route) return errorResponse(404, "not_found", "unknown path");
     if (route.kind === "badRequest") return errorResponse(400, "bad_request", route.message);
-    let validRealmId: boolean;
-    try {
-      validRealmId = isValidRealmId(route.realmId, env.REALM_NAME_PATTERN);
-    } catch {
-      return errorResponse(500, "bad_request", "invalid REALM_NAME_PATTERN");
+    if (!isValidRealmId(route.realmId)) {
+      return errorResponse(400, "bad_request", "invalid realm name");
     }
-    if (!validRealmId) return errorResponse(400, "bad_request", "invalid realm name");
     if (!env.REALM_TOKEN) return errorResponse(500, "bad_request", "REALM_TOKEN is not configured");
     if (!env.ABLY_API_KEY) return errorResponse(500, "bad_request", "ABLY_API_KEY is not configured");
     if (route.kind === "methodNotAllowed") return errorResponse(405, "bad_request", "method not allowed");
@@ -119,8 +110,6 @@ async function metrics(request: Request, env: Env): Promise<Response> {
   }
 
   const values = await new RealmStore(env.DB).metrics();
-  const maxRealms = numericLimit(env.MAX_REALMS, 65_536);
-  const maxRealmsPerIp = numericLimit(env.MAX_REALMS_PER_IP, 4);
   const body = [
     "# TYPE hysteria_realm_realms_registered gauge",
     `hysteria_realm_realms_registered ${values.realms}`,
@@ -130,10 +119,6 @@ async function metrics(request: Request, env: Env): Promise<Response> {
     `hysteria_realm_pending_connects ${values.attempts}`,
     "# TYPE hysteria_realm_event_streams_active gauge",
     `hysteria_realm_event_streams_active ${values.streams}`,
-    "# TYPE hysteria_realm_global_limit gauge",
-    `hysteria_realm_global_limit ${maxRealms}`,
-    "# TYPE hysteria_realm_ip_limit gauge",
-    `hysteria_realm_ip_limit ${maxRealmsPerIp}`,
     "",
   ].join("\n");
   return new Response(body, {
@@ -149,21 +134,9 @@ async function register(request: Request, app: App, route: { realmId: string }):
   const addresses = validateAddresses(body.addresses);
   if (typeof addresses === "string") return errorResponse(400, "bad_request", addresses);
 
-  const result = await app.store.register(
-    route.realmId,
-    addresses,
-    clientIp(request, app.env),
-    numericLimit(app.env.MAX_REALMS, 65_536),
-    numericLimit(app.env.MAX_REALMS_PER_IP, 4),
-  );
+  const result = await app.store.register(route.realmId, addresses);
   if (result.status === "realm_taken") {
     return errorResponse(409, "realm_taken", "realm is already registered");
-  }
-  if (result.status === "realm_limit_reached") {
-    return errorResponse(429, "realm_limit_reached", "maximum number of realms reached");
-  }
-  if (result.status === "ip_limit_reached") {
-    return errorResponse(429, "ip_limit_reached", "maximum realms per client IP reached");
   }
   return jsonResponse(200, { session_id: result.session.id, ttl: SESSION_TTL_MS / 1000 });
 }
@@ -499,34 +472,6 @@ async function closeSession(
     // TTL checks and endConnect still provide correct behavior if cancellation is lost.
     debug(app.env, "session cancellation publish failed", error);
   }
-}
-
-function numericLimit(value: string | undefined, fallback: number): number {
-  if (value === undefined || value === "") return fallback;
-  const parsed = Number(value);
-  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
-}
-
-function clientIp(request: Request, env: Env): string {
-  const header = env.TRUSTED_PROXY_HEADER ?? "CF-Connecting-IP";
-  const trusted = header ? normalizeClientIp(request.headers.get(header)) : null;
-  return trusted ?? normalizeClientIp(request.headers.get("CF-Connecting-IP")) ?? "unknown";
-}
-
-function normalizeClientIp(value: string | null): string | null {
-  if (!value) return null;
-  let candidate = value.split(",", 1)[0].trim();
-  if (candidate.startsWith("[")) {
-    const end = candidate.indexOf("]");
-    if (end < 0) return null;
-    candidate = candidate.slice(1, end);
-  } else {
-    const colon = candidate.lastIndexOf(":");
-    if (colon > 0 && candidate.indexOf(":") === colon && /^\d+$/.test(candidate.slice(colon + 1))) {
-      candidate = candidate.slice(0, colon);
-    }
-  }
-  return normalizeIpAddress(candidate);
 }
 
 function debug(env: Env, message: string, error?: unknown): void {

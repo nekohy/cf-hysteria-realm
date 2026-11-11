@@ -1,31 +1,22 @@
 # cf-hysteria-realm
 
-A Hy2 Realm rendezvous service on Cloudflare Workers, implementing the original HTTP/SSE protocol and dynamically named realms.
+在 Cloudflare Workers 上运行的 Hy2 Realm 会合服务，支持原版 HTTP/SSE 协议和动态多 realm。
 
-Maintained by [Nekohy](https://github.com/nekohy) · [中文说明](README.zh-CN.md) · [Technical docs](docs/technical.md)
+维护者：[Nekohy](https://github.com/nekohy) · [技术文档](docs/technical.md)
 
-## Features
+## 一键部署
 
-- Original register, deregister, heartbeat, SSE, connect, and connect-response endpoints.
-- D1 persistence for sessions, quotas, attempts, and a 16-event outbox; Ably for realtime notifications.
-- Original 409/429 quota behavior, 60-second TTL, 10-second wait, and address fallback.
-- No Durable Objects, database polling, or runtime npm dependencies.
-
-Only UDP hole-punching metadata passes through this service; Hysteria traffic is not relayed.
-
-## One-click deploy
-
-Prepare free Cloudflare and Ably accounts and create an Ably API key with **publish + subscribe** permission.
+准备 Cloudflare 和 Ably 免费账号，并创建具有 **publish + subscribe** 权限的 Ably API Key。
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/nekohy/cf-hysteria-realm)
 
-1. Click the button, authorize GitHub and Cloudflare, and confirm the source is `nekohy/cf-hysteria-realm`.
-2. Enter `REALM_TOKEN` and `ABLY_API_KEY`. Cloudflare creates D1 and the deploy script applies the initial schema.
-3. Use the deployed Worker URL and `REALM_TOKEN` in your Hy2 Realm configuration.
+1. 点击按钮并授权 GitHub、Cloudflare，确认来源为 `nekohy/cf-hysteria-realm`。
+2. 填写 `REALM_TOKEN` 和 `ABLY_API_KEY`。Cloudflare 会创建 D1，部署脚本会应用初始 schema。
+3. 在 Hy2 Realm 配置中使用部署后的 Worker URL 和 `REALM_TOKEN`。
 
-## Manual deploy
+## 手动部署
 
-Node.js 24+ is required:
+要求 Node.js 24+：
 
 ```bash
 git clone https://github.com/nekohy/cf-hysteria-realm.git
@@ -38,27 +29,21 @@ corepack pnpm exec wrangler secret put ABLY_API_KEY
 corepack pnpm run deploy
 ```
 
-No `database_id` is needed; migrations and deployment use the `DB` binding. To enable `/metrics`, also run `wrangler secret put METRICS_TOKEN`.
+无需填写 `database_id`，migration 和部署均使用 `DB` 绑定。需要 `/metrics` 时，再执行 `wrangler secret put METRICS_TOKEN`。
 
-## Configuration
+## 配置
 
-| Name | Default | Description |
+| 名称 | 默认值 | 说明 |
 | --- | --- | --- |
-| `REALM_TOKEN` | Required Secret | Random token shared by realm servers and clients. |
-| `ABLY_API_KEY` | Required Secret | Full Ably key with publish/subscribe permission. |
-| `MAX_REALMS` | `65536` | Global active realm limit; `0` is unlimited. |
-| `MAX_REALMS_PER_IP` | `4` | Active realms per IP; `0` is unlimited. |
-| `REALM_NAME_PATTERN` | Original pattern | Optional JavaScript regular expression. |
-| `TRUSTED_PROXY_HEADER` | `CF-Connecting-IP` | Trusted client-IP header. |
-| `METRICS_TOKEN` | Unset | Enables `/metrics` with separate Bearer authentication. |
-| `DEBUG` | `false` | Set to `true` for troubleshooting. |
+| `REALM_TOKEN` | 必填 Secret | realm server 与 client 共用的随机 token。 |
+| `ABLY_API_KEY` | 必填 Secret | 具有 publish/subscribe 权限的完整 Ably Key。 |
+| `METRICS_TOKEN` | 未设置 | 设置后启用带独立 Bearer 认证的 `/metrics`。 |
+| `DEBUG` | `false` | 排查问题时设为 `true`。 |
 
-Only use a `TRUSTED_PROXY_HEADER` overwritten by a trusted proxy; otherwise clients can spoof it to bypass per-IP quotas.
-
-## Local development and tests
+## 本地开发与测试
 
 ```bash
-cp .dev.vars.example .dev.vars  # Set a real token and Ably key
+cp .dev.vars.example .dev.vars  # 填入真实 token 和 Ably Key
 corepack pnpm run db:migrate:local
 corepack pnpm run dev
 ```
@@ -68,8 +53,6 @@ corepack pnpm run typecheck
 corepack pnpm run test
 corepack pnpm exec wrangler deploy --dry-run
 ```
-
-Workers, D1, and Ably free quotas are shared per account. Actual capacity depends on heartbeat rate, connect activity, and other account projects. See the [technical docs](docs/technical.md) for protocol and runtime details.
 
 ## License
 

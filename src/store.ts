@@ -32,9 +32,7 @@ export interface StoredEvent {
 
 export type RegisterResult =
   | { status: "ok"; session: StoredSession }
-  | { status: "realm_taken" }
-  | { status: "realm_limit_reached" }
-  | { status: "ip_limit_reached" };
+  | { status: "realm_taken" };
 
 export interface MetricsResult {
   realms: number;
@@ -101,8 +99,6 @@ interface EventRow {
 
 interface RegistrationCheckRow {
   realm_taken: number;
-  realms: number;
-  owner_realms: number;
 }
 
 interface ClaimedEventRow extends EventRow {
@@ -135,13 +131,7 @@ export class RealmStore {
     return row ? toSession(row) : null;
   }
 
-  async register(
-    realmId: string,
-    addresses: string[],
-    ownerIp: string,
-    maxRealms: number,
-    maxRealmsPerIp: number,
-  ): Promise<RegisterResult> {
+  async register(realmId: string, addresses: string[]): Promise<RegisterResult> {
     const now = Date.now();
     const session: StoredSession = {
       realmId,
@@ -152,38 +142,17 @@ export class RealmStore {
     const registrationCondition = `NOT EXISTS (
       SELECT 1 FROM realm_sessions
       WHERE realm_id = ? AND expires_at > ?
-    )
-    AND (? = 0 OR (SELECT COUNT(*) FROM realm_sessions WHERE expires_at > ?) < ?)
-    AND (
-      ? = 0 OR (
-        SELECT COUNT(*) FROM realm_sessions WHERE owner_ip = ? AND expires_at > ?
-      ) < ?
     )`;
-    const conditionArguments = [
-      realmId,
-      now,
-      maxRealms,
-      now,
-      maxRealms,
-      maxRealmsPerIp,
-      ownerIp,
-      now,
-      maxRealmsPerIp,
-    ];
+    const conditionArguments = [realmId, now];
 
     const [checkResult, , , , insertResult] = await this.db.batch([
       this.db
         .prepare(
-          `SELECT
-             EXISTS (
-               SELECT 1 FROM realm_sessions WHERE realm_id = ? AND expires_at > ?
-             ) AS realm_taken,
-             (SELECT COUNT(*) FROM realm_sessions WHERE expires_at > ?) AS realms,
-             (
-               SELECT COUNT(*) FROM realm_sessions WHERE owner_ip = ? AND expires_at > ?
-             ) AS owner_realms`,
+          `SELECT EXISTS (
+             SELECT 1 FROM realm_sessions WHERE realm_id = ? AND expires_at > ?
+           ) AS realm_taken`,
         )
-        .bind(realmId, now, now, ownerIp, now),
+        .bind(realmId, now),
       this.db
         .prepare(
           `DELETE FROM connect_attempts
@@ -204,19 +173,17 @@ export class RealmStore {
         .bind(realmId, ...conditionArguments),
       this.db
         .prepare(
-          `INSERT INTO realm_sessions (realm_id, id, owner_ip, addresses, expires_at)
-           SELECT ?, ?, ?, ?, ?
+          `INSERT INTO realm_sessions (realm_id, id, addresses, expires_at)
+           SELECT ?, ?, ?, ?
            WHERE ${registrationCondition}
            ON CONFLICT (realm_id) DO UPDATE SET
              id = excluded.id,
-             owner_ip = excluded.owner_ip,
              addresses = excluded.addresses,
              expires_at = excluded.expires_at`,
         )
         .bind(
           session.realmId,
           session.id,
-          ownerIp,
           JSON.stringify(session.addresses),
           session.expiresAt,
           ...conditionArguments,
@@ -226,10 +193,6 @@ export class RealmStore {
     const checks = checkResult.results[0] as RegistrationCheckRow | undefined;
     if (!checks) throw new Error("registration check returned no row");
     if (checks.realm_taken !== 0) return { status: "realm_taken" };
-    if (maxRealms > 0 && checks.realms >= maxRealms) return { status: "realm_limit_reached" };
-    if (maxRealmsPerIp > 0 && checks.owner_realms >= maxRealmsPerIp) {
-      return { status: "ip_limit_reached" };
-    }
     if (insertResult.meta.changes !== 1) throw new Error("conditional registration did not insert");
     return { status: "ok", session };
   }

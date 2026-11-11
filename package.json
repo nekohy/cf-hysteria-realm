@@ -27,18 +27,6 @@
       "METRICS_TOKEN": {
         "description": "Optional separate Bearer token that enables GET /metrics."
       },
-      "REALM_NAME_PATTERN": {
-        "description": "Optional JavaScript realm-name regular expression; defaults to the Hy2 Realm pattern."
-      },
-      "MAX_REALMS": {
-        "description": "Maximum active realms. Set to 0 for unlimited; defaults to 65536."
-      },
-      "MAX_REALMS_PER_IP": {
-        "description": "Maximum active realms registered by one client IP. Set to 0 for unlimited; defaults to 4."
-      },
-      "TRUSTED_PROXY_HEADER": {
-        "description": "Trusted client IP header. Defaults to CF-Connecting-IP; only use a header overwritten by your proxy."
-      },
       "DEBUG": {
         "description": "Set to true only while troubleshooting."
       }
