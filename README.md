@@ -11,7 +11,7 @@
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/nekohy/cf-hysteria-realm)
 
 1. 点击按钮并授权 GitHub、Cloudflare，确认来源为 `nekohy/cf-hysteria-realm`。
-2. 填写 `REALM_TOKEN` 和 `ABLY_API_KEY`。Cloudflare 会创建 D1，部署脚本会应用初始 schema。
+2. 填写 `REALM_TOKEN` 和 `ABLY_API_KEY`。Cloudflare 会创建 D1，Worker 会在首次访问或冷启动时自动创建数据表和索引。
 3. 在 Hy2 Realm 配置中使用部署后的 Worker URL 和 `REALM_TOKEN`。
 
 ## 手动部署
@@ -29,7 +29,7 @@ corepack pnpm exec wrangler secret put ABLY_API_KEY
 corepack pnpm run deploy
 ```
 
-无需填写 `database_id`，migration 和部署均使用 `DB` 绑定。需要 `/metrics` 时，再执行 `wrangler secret put METRICS_TOKEN`。
+无需填写 `database_id`，部署使用 `DB` 绑定。Worker 会在首次访问或冷启动时自动创建数据表和索引。需要 `/metrics` 时，再执行 `wrangler secret put METRICS_TOKEN`。
 
 ## 配置
 
@@ -44,9 +44,10 @@ corepack pnpm run deploy
 
 ```bash
 cp .dev.vars.example .dev.vars  # 填入真实 token 和 Ably Key
-corepack pnpm run db:migrate:local
 corepack pnpm run dev
 ```
+
+本地开发无需手动初始化数据库，Worker 会在首次访问或冷启动时自动建表。
 
 ```bash
 corepack pnpm run typecheck

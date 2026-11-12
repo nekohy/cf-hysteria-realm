@@ -1,4 +1,4 @@
-import schemaSql from "../migrations/0001_init.sql";
+import schemaSql from "./schema.sql";
 
 // D1 exec() splits multi-line DDL incorrectly; prepare one statement at a time instead.
 // This initial schema uses semicolons only as statement terminators.

@@ -19,8 +19,7 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "cf-hysteria-realm",
-      "migrations_dir": "migrations"
+      "database_name": "cf-hysteria-realm"
     }
   ],
   "triggers": {

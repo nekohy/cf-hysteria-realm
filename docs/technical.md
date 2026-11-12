@@ -172,11 +172,10 @@ Create D1 once with `corepack pnpm exec wrangler d1 create cf-hysteria-realm`. N
 
 ```bash
 cp .dev.vars.example .dev.vars
-corepack pnpm run db:migrate:local
 corepack pnpm run dev
 ```
 
-Local event delivery requires a real Ably key. Unit and integration tests use `node:sqlite` and mocked Ably responses instead.
+The Worker creates tables and indexes automatically on first request or cold start, so local development needs no separate database initialization command. Local event delivery requires a real Ably key. Unit and integration tests use `node:sqlite` and mocked Ably responses instead.
 
 ## Checks
 

@@ -34,7 +34,7 @@ const [{ readFileSync }, { DatabaseSync }] = await Promise.all([
 ]);
 
 const NOW = new Date("2026-06-01T00:00:00.000Z").getTime();
-const MIGRATION_SQL = readFileSync("migrations/0001_init.sql", "utf8");
+const SCHEMA_SQL = readFileSync("src/schema.sql", "utf8");
 const INITIAL_ADDRESSES = ["203.0.113.10:4433"];
 const UPDATED_ADDRESSES = ["203.0.113.11:4433"];
 const FRESH_ADDRESSES = ["198.51.100.20:9999"];
@@ -102,7 +102,7 @@ class FakeD1Database {
   private readonly database: SqliteDatabase = new DatabaseSync(":memory:");
 
   constructor() {
-    this.database.exec(MIGRATION_SQL);
+    this.database.exec(SCHEMA_SQL);
   }
 
   prepare(query: string): FakeD1PreparedStatement {
