@@ -42,7 +42,10 @@ function storedEvent(
 
 function env(): Env {
   return {
-    DB: { exec: vi.fn().mockResolvedValue({ count: 0, duration: 0 }) } as unknown as D1Database,
+    DB: {
+      prepare: vi.fn((sql: string) => ({ sql })),
+      batch: vi.fn().mockResolvedValue([]),
+    } as unknown as D1Database,
     REALM_TOKEN,
     ABLY_API_KEY: "key-id:secret",
     DEBUG: "false",
